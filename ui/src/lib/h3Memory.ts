@@ -3,8 +3,44 @@ import type { ModelOptions, SlidingWindowMemoryPolicy } from '../types'
 // 17*n+5 frames at 24fps: 29.958s, outside H3's published 15s envelope.
 export const H3_EXPERIMENTAL_MAX_FRAMES = 719
 
+/** Older Flex backends expose only a native pass; newer ones own H3 history. */
+export function isPikaFlexSinglePass(options?: ModelOptions | null): boolean {
+  return options?.minimax_h3_pika_flex === true
+    && !(options.sliding_window === true && options.video_continuation === true)
+}
+
+/** Resolve Pika Flex identity from the selected model before async options load. */
+export function isPikaFlexModelType(
+  modelType: unknown,
+  options?: ModelOptions | null,
+): boolean {
+  return modelType === 'minimax_h3_pika_flex'
+    || modelType === 'minimax_h3_ref2va_pika_flex'
+    || (!!modelType && options?.model_type === modelType
+      && options.minimax_h3_pika_flex === true)
+}
+
+/** Clear only the unsupported First Block cache fields for the effective Pika request. */
+export function clearPikaFlexCacheSettings<T extends {
+  skip_steps_cache_type?: unknown
+  skip_steps_multiplier?: unknown
+  skip_steps_start_step_perc?: unknown
+}>(
+  modelType: unknown,
+  params: T,
+  options?: ModelOptions | null,
+): T {
+  if (!isPikaFlexModelType(modelType, options)) return params
+  params.skip_steps_cache_type = ''
+  delete params.skip_steps_multiplier
+  delete params.skip_steps_start_step_perc
+  return params
+}
+
 export function supportsH3ExtendedDuration(options?: ModelOptions | null): boolean {
   return !!options && !options.audio_only && options.model_type !== 'viggle_animate'
+    && !options.minimax_h3_fasth3
+    && !options.minimax_h3_pika_flex
     && String(options.architecture || '').startsWith('minimax_h3')
 }
 
@@ -16,9 +52,25 @@ export function h3MaximumFrames(options?: ModelOptions | null, extended?: unknow
 export type H3MemoryRecommendation = {
   supported: boolean
   frames: number | null
+  basis: H3RecommendationBasis
+  note?: string
+  evidence?: string[]
+  version?: string | number
   baseFrames?: number | null
   referenceMarginFrames?: number
+  referenceMarginSteps?: number
   fallbackResolution?: string
+}
+
+export type H3RecommendationBasis = 'tested' | 'reported' | 'estimated' | 'conservative'
+
+export function h3RecommendationLabel(basis?: H3RecommendationBasis | null): string {
+  switch (basis ?? 'conservative') {
+    case 'tested': return 'Tested recommendation'
+    case 'reported': return 'Reported recommendation'
+    case 'estimated': return 'Estimated starting point'
+    default: return 'Conservative starting point'
+  }
 }
 
 /** Stable key for a user-saved H3 native-pass override. */
@@ -30,6 +82,7 @@ export function recommendedH3PassProfile(
   policy: SlidingWindowMemoryPolicy | null | undefined,
   resolution: string,
   totalVramGb: number,
+  totalRamGb?: number,
 ): H3MemoryRecommendation | null {
   if (!policy || !Number.isFinite(totalVramGb) || totalVramGb <= 0) return null
   const normalizedResolution = String(resolution || '').trim().toLowerCase()
@@ -39,6 +92,26 @@ export function recommendedH3PassProfile(
     if (match) pixels = Number(match[1]) * Number(match[2])
   }
   if (!pixels) return null
+  // Match explicit resource-policy rows when RAM is known. Unknown RAM must
+  // never qualify for a larger automatic pass from a resource-policy tier.
+  const measured = Number.isFinite(totalRamGb) && Number(totalRamGb) > 0
+    ? policy.resource_recommendations?.tiers.find(tier => (
+        tier.checkpoint === policy.checkpoint
+        && totalVramGb >= tier.min_vram_gb && totalVramGb <= tier.max_vram_gb
+        && Number(totalRamGb) >= tier.min_ram_gb
+        && (tier.max_ram_gb == null || Number(totalRamGb) <= tier.max_ram_gb)
+        && pixels! >= (tier.min_pixels ?? 0) && pixels! <= tier.max_pixels
+      )) : undefined
+  if (measured) return {
+    supported: measured.frames != null && measured.frames > 0,
+    frames: measured.frames,
+    basis: measured.basis ?? 'conservative',
+    note: measured.note,
+    evidence: measured.evidence,
+    version: policy.resource_recommendations?.version,
+    referenceMarginSteps: measured.reference_margin_steps,
+    fallbackResolution: measured.fallback_resolution,
+  }
   const band = policy.resolution_bands.find(item => pixels! >= item.min_pixels)
   const tier = band?.vram_tiers.find(item => (
     item.max_vram_gb == null || totalVramGb <= item.max_vram_gb
@@ -48,6 +121,10 @@ export function recommendedH3PassProfile(
   return {
     supported: frames != null,
     frames,
+    basis: 'conservative',
+    note: frames != null
+      ? 'Legacy VRAM and resolution profile; use as a conservative starting point.'
+      : undefined,
     fallbackResolution: tier.fallback_resolution,
   }
 }
@@ -128,8 +205,9 @@ export function recommendedH3OmniSequenceProfile(
   minimumFrames: number,
   maximumFrames: number,
   frameStep: number,
+  totalRamGb?: number,
 ): H3MemoryRecommendation | null {
-  const profile = recommendedH3PassProfile(policy, resolution, totalVramGb)
+  const profile = recommendedH3PassProfile(policy, resolution, totalVramGb, totalRamGb)
   if (!profile || !profile.supported || profile.frames == null) return profile
   const baseFrames = normalizeH3NativeFrames(
     profile.frames,
@@ -137,7 +215,9 @@ export function recommendedH3OmniSequenceProfile(
     maximumFrames,
     frameStep,
   )
-  const marginSteps = Math.max(0, Math.round(policy?.reference_margin_steps ?? 1))
+  const marginSteps = Math.max(0, Math.round(
+    profile.referenceMarginSteps ?? policy?.reference_margin_steps ?? 1,
+  ))
   const safeFrames = normalizeH3NativeFrames(
     baseFrames - marginSteps * Math.max(1, frameStep),
     minimumFrames,
@@ -156,6 +236,7 @@ export function effectiveH3OmniSequenceFrames({
   policy,
   resolution,
   totalVramGb,
+  totalRamGb,
   minimumFrames,
   maximumFrames,
   frameStep,
@@ -165,6 +246,7 @@ export function effectiveH3OmniSequenceFrames({
   policy: SlidingWindowMemoryPolicy | null | undefined
   resolution: string
   totalVramGb: number
+  totalRamGb?: number
   minimumFrames: number
   maximumFrames: number
   frameStep: number
@@ -184,6 +266,7 @@ export function effectiveH3OmniSequenceFrames({
     minimumFrames,
     maximumFrames,
     frameStep,
+    totalRamGb,
   )
   return {
     frames: manualOverride || recommendation?.frames == null

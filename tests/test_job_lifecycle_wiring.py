@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import ast
 import os
+from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(_ROOT, "app"))
 
 
 def _parse(relative_path: str) -> ast.Module:
@@ -50,6 +55,133 @@ class TestJobLifecycleWiring(unittest.TestCase):
     def setUpClass(cls):
         cls.launch = _parse("app/launch.py")
 
+    def test_optional_finishing_warnings_survive_status_and_browser_reconnection(self):
+        from app.services.job_lifecycle import snapshot_job
+        from services.agent_access.backend import AgentAccessBackend, is_restricted_agent
+        from services.agent_access.context import principal_context
+        from services.generation_details import is_terminal_studio_failure, public_generation_details
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        access_root = os.path.join(scratch.name, "app")
+        os.makedirs(access_root)
+        backend = AgentAccessBackend(
+            SimpleNamespace(
+                directory=Path(scratch.name) / "settings",
+                backend=lambda: {},
+            ),
+            access_root,
+            recover_previous=False,
+        )
+        warning = "DLSS finishing failed; the generated original was kept."
+        base = {"status": "completed", "progress": 100, "message": "Done",
+                "output_files": ["clip.mp4"], "error": None, "params": {}, "created_at": 1}
+        jobs = {
+            "warning": {**base, "id": "warning", "finishing_warnings": [warning]},
+            "ordinary": {**base, "id": "ordinary"},
+            "dismissed": {**base, "id": "dismissed", "finishing_warnings": [warning], "dismissed": True},
+        }
+        namespace = {"_jobs": jobs, "snapshot_job": snapshot_job,
+                     "_agent_access_backend": backend,
+                     "_is_restricted_agent": is_restricted_agent,
+                     "principal_context": principal_context,
+                     "is_terminal_studio_failure": is_terminal_studio_failure,
+                     "public_generation_details": public_generation_details,
+                     "_gen_lock": threading.Lock(),
+                     "_active_gen_states": {},
+                     "public_enhancement": lambda record, **_kwargs: record,
+                     "_director_job_response_fields": lambda _job: {},
+                     "_job_eta_response_fields": lambda _job: {},
+                     "_generation_previews": SimpleNamespace(fields=lambda _job: {})}
+        helper = _function(_parse("app/launch.py"), "_agent_require_job_access")
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+                     "launch.py", "exec"), namespace)
+        for name in ("get_status", "list_jobs"):
+            function = _function(_parse("app/launch.py"), name)
+            function.decorator_list = []
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                         "launch.py", "exec"), namespace)
+        status = namespace["get_status"]("warning")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["output_files"], ["clip.mp4"])
+        self.assertEqual(status["finishing_warnings"], [warning])
+        self.assertEqual(namespace["get_status"]("ordinary")["finishing_warnings"], [])
+        history = namespace["list_jobs"]()["jobs"]
+        self.assertEqual([job["job_id"] for job in history], ["warning"])
+        self.assertEqual(history[0]["finishing_warnings"], [warning])
+
+    def test_completion_push_reports_finishing_warning_without_calling_it_generation_failure(self):
+        notices = []
+        namespace = {"_play_host_completion_sound": lambda: None,
+                     "_web_push": SimpleNamespace(dispatch=lambda **notice: notices.append(notice))}
+        notify = _load_isolated_function("app/launch.py", "_on_generation_job_terminal", namespace)
+        warning = "Media Flow failed; the generated original was kept."
+        notify({"id": "warning", "finishing_warnings": [warning]}, "completed")
+        self.assertEqual(notices[0]["category"], "completion")
+        self.assertEqual(notices[0]["title"], "Studio generation complete with warnings")
+        self.assertEqual(notices[0]["body"], warning)
+        notify({"id": "ordinary"}, "completed")
+        self.assertEqual(notices[1]["title"], "Studio generation complete")
+        self.assertEqual(notices[1]["body"], "Your Maestro generation is ready.")
+
+    def test_studio_finishing_and_metadata_failures_keep_generation_successful(self):
+        from services import media_flow, media_info
+        from services.job_lifecycle import finish_job, is_cancel_requested, update_job
+        worker = _function(_parse("app/launch.py"), "_run_generation")
+        branch = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "success and (pp_media_spatial or pp_media_temporal)")
+        code = compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])),
+                       "studio-optional-finishing", "exec")
+        for failure in ("native", "before_probe", "after_metadata", "cancelled"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                source = os.path.join(folder, "clip.mp4")
+                with open(source, "wb") as output:
+                    output.write(b"original video")
+                job = {"id": "optional-finishing", "status": "running", "error": None}
+                processing = {}
+
+                def process(*_args, **_kwargs):
+                    if failure == "native":
+                        raise RuntimeError("NGX 0xBAD00000")
+                    if failure == "cancelled":
+                        job["cancel_requested"] = True
+                        raise media_flow.ProcessingCancelled("cancelled")
+                    with open(source, "wb") as output:
+                        output.write(b"finished video")
+
+                namespace = {"success": True, "pp_media_spatial": "dlss5*1.5",
+                             "pp_media_temporal": "", "pp_media_options": {},
+                             "wgp": SimpleNamespace(release_model=lambda: None),
+                             "new_files": ["clip.mp4"], "out_dir": folder, "os": os, "time": time,
+                             "job": job, "processing_by_output": processing,
+                             "update_job": update_job, "is_cancel_requested": is_cancel_requested,
+                             "traceback": SimpleNamespace(print_exc=lambda: None), "print": lambda *_: None}
+                with patch.object(media_flow, "process_generation_video", side_effect=process) as stage, \
+                     patch.object(media_info, "probe_media", side_effect=(
+                         RuntimeError("probe failed") if failure == "before_probe" else None), return_value={}), \
+                     patch.object(media_info, "processing_record", side_effect=(
+                         RuntimeError("metadata failed") if failure == "after_metadata" else None), return_value={}):
+                    if failure == "cancelled":
+                        with self.assertRaises(media_flow.ProcessingCancelled):
+                            exec(code, namespace)
+                        self.assertFalse(finish_job(job, "completed"))
+                        self.assertEqual(job["status"], "cancelled")
+                        self.assertNotIn("finishing_warnings", job)
+                        continue
+                    exec(code, namespace)
+                self.assertTrue(finish_job(job, "completed", output_files=["clip.mp4"]))
+                self.assertEqual(job["status"], "completed")
+                self.assertIsNone(job["error"])
+                self.assertEqual(len(job["finishing_warnings"]), 1)
+                self.assertEqual(processing["clip.mp4"]["warnings"], job["finishing_warnings"])
+                with open(source, "rb") as output:
+                    self.assertEqual(output.read(), b"finished video" if failure == "after_metadata" else b"original video")
+                if failure == "before_probe":
+                    stage.assert_not_called()
+                if failure == "after_metadata":
+                    self.assertIn("completed", job["finishing_warnings"][0])
+                    self.assertNotIn("original was kept", job["finishing_warnings"][0])
+
     def test_stream_error_survives_the_final_queue_status(self):
         from app.services.job_lifecycle import update_job, finish_job
         worker = _function(self.launch, '_run_generation')
@@ -67,6 +199,69 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertEqual(job['status'], 'failed')
         self.assertEqual(job['error'], 'Notation package could not load')
         self.assertEqual(job['message'], 'Error: Notation package could not load')
+
+    def test_skipped_or_outputless_generation_never_emits_completed(self):
+        from app.services.job_lifecycle import finish_job, register_terminal_listener, unregister_terminal_listener, update_job
+        worker = _function(self.launch, "_run_generation")
+        success_assignment = next(node for node in ast.walk(worker) if isinstance(node, ast.Assign)
+                                  and any(isinstance(target, ast.Name) and target.id == "success" for target in node.targets))
+        output_guard = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                            and ast.unparse(node.test) == "not new_files")
+        terminal = next(node for node in ast.walk(worker) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == "finish_job"
+                        and any(isinstance(value, ast.Constant) and value.value == "Generation failed"
+                                for value in ast.walk(node)))
+        module = ast.fix_missing_locations(ast.Module(
+            body=[success_assignment, output_guard, ast.Expr(value=terminal)], type_ignores=[],
+        ))
+        observed_statuses = []
+        listener = lambda job, status: observed_statuses.append(status)
+        register_terminal_listener(listener)
+        try:
+            for total, completed, files, error, status in (
+                (1, 0, [], "Task 1 failed validation", "failed"),
+                (2, 1, ["partial.mp4"], "Task 2 failed validation", "failed"),
+                (1, 1, [], None, "failed"),
+                (0, 0, [], None, "failed"),
+                (1, 1, ["clip.mp4"], None, "completed"),
+                (2, 2, ["first.mp4", "second.mp4"], None, "completed"),
+            ):
+                with self.subTest(total=total, completed=completed, files=files):
+                    job = {"id": "output-check", "status": "running", "error": error, "output_files": files}
+                    namespace = {
+                        "job": job, "cancelled": False, "total_tasks": total, "completed": completed,
+                        "new_files": files, "update_job": update_job, "finish_job": finish_job,
+                    }
+                    exec(compile(module, "generation-output-check", "exec"), namespace)
+                    self.assertEqual(job["status"], status)
+                    self.assertEqual(observed_statuses[-1], status)
+                    self.assertEqual(job["output_files"], files, "Partial outputs remain available on failure")
+                    if error:
+                        self.assertEqual(job["error"], error, "Keep the original validation error")
+                    elif status == "failed":
+                        self.assertIn("no output", job["error"])
+                    else:
+                        self.assertEqual(job["message"], "Done")
+        finally:
+            unregister_terminal_listener(listener)
+
+    def test_validation_skip_has_an_actionable_job_error(self):
+        from app.services.job_lifecycle import update_job
+        worker = _function(self.launch, "_run_generation")
+        invalid = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                       and ast.unparse(node.test) == "validated_params is None")
+        # Run the actual skip branch inside its loop, retaining its continue.
+        loop = ast.For(target=ast.Name(id="_", ctx=ast.Store()),
+                       iter=ast.List(elts=[ast.Constant(value=0)], ctx=ast.Load()),
+                       body=[invalid], orelse=[])
+        module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+        job = {"id": "invalid-injected-frames", "status": "running", "error": None}
+        namespace = {"validated_params": None, "task_no": 1, "skipped": 0,
+                     "job": job, "update_job": update_job, "print": lambda *args: None}
+        exec(compile(module, "generation-validation-error", "exec"), namespace)
+        self.assertEqual(namespace["skipped"], 1)
+        self.assertIn("failed validation", job["error"])
+        self.assertIn("required inputs", job["message"])
 
     def test_each_worker_uses_lifecycle_transitions(self):
         expected = {
@@ -164,9 +359,18 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 for node in ast.walk(submission)
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             }
-            self.assertIn("_client_submission_id", constants)
+            self.assertIn("_pop_editor_submission", _called_names(submission))
             self.assertIn("client_submission_id", constants)
             self.assertIn("show_in_gallery", constants)
+
+        editor_submission = _function(self.launch, "_pop_editor_submission")
+        editor_submission_constants = {
+            node.value
+            for node in ast.walk(editor_submission)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("_client_submission_id", editor_submission_constants)
+        self.assertIn("client_submission_id", editor_submission_constants)
 
         with open(
             os.path.join(_ROOT, "ui", "src", "stores", "useStore.ts"),

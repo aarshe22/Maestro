@@ -11,15 +11,17 @@ import subprocess
 import threading
 import sys
 import time
+import contextlib
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-import torch
-from mmgp import offload
-from shared.utils import offload_registry
+
+if TYPE_CHECKING:
+    import torch
 
 
 RUNTIME = Path(__file__).resolve().parents[2] / "dlss5"
@@ -41,6 +43,25 @@ NR_FILES = (
     NR_WORKER,
 )
 DLSSG_FILES = (DLSSG_DIR / "nvngx_dlssg.dll", DLSSG_WORKER)
+NR_PROBE_TIMEOUT_SECONDS = 60.0
+# Exercise both-axis padding and output cropping, rather than an already
+# aligned 128x128 DLAA frame that cannot reveal the issue #190 size constraint.
+NR_PROBE_GEOMETRY = (144, 160, 1.5)
+_nr_probe_lock = threading.Lock()
+_nr_probe_cache_lock = threading.Lock()
+_nr_probe_cache: dict[tuple, dict] = {}
+_nr_probe_epoch = 0
+
+
+def uses_experimental_backend() -> bool:
+    """Explicit installation enables only the tested Windows 10 path."""
+    if os.name != "nt" or not 19045 <= sys.getwindowsversion().build < 22000:
+        return False
+    try:
+        config = json.loads((RUNTIME / "direct/enabled.json").read_text(encoding="utf8"))
+        return config.get("enabled") is True
+    except (OSError, ValueError, AttributeError):
+        return False
 
 NR_MODES = {
     1.0: ("DLAA", 5),
@@ -64,12 +85,15 @@ def configure_depth_estimator(server_config):
 
 
 def _offload_guide_model(name, model):
+    from mmgp import offload
+    from shared.utils import offload_registry
     offloadobj = offload.profile({"model": model}, profile_no=3, quantizeTransformer=False, convertWeightsFloatTo=None, pinnedMemory=False, verboseLevel=-1)
     _GUIDE_OFFLOADS[name] = offloadobj
     offload_registry.register_offloadobj(name, offloadobj, release_flow_model)
 
 
 def _raft_model(device: torch.device):
+    import torch
     key = str(device)
     if key not in _RAFT_MODELS:
         from preprocessing.raft.raft import RAFT
@@ -85,6 +109,8 @@ def _raft_model(device: torch.device):
 
 
 def release_flow_model():
+    if _GUIDE_OFFLOADS:
+        from shared.utils import offload_registry
     for name, offloadobj in _GUIDE_OFFLOADS.items():
         offload_registry.unregister_offloadobj(name, offloadobj)
         offloadobj.release()
@@ -99,6 +125,7 @@ def release_flow_model():
 
 
 def _depth_model(device: torch.device):
+    import torch
     variant = DEPTH_MODEL_VARIANT
     key = (variant, str(device))
     if key not in _DEPTH_MODELS:
@@ -128,6 +155,8 @@ def dlssg_capabilities() -> dict:
         return {}
     try:
         result = subprocess.run([str(DLSSG_WORKER), "--probe"], cwd=str(DLSSG_DIR), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode != 0:
+            return {}
         capabilities = json.loads(result.stdout.strip())
         return capabilities if isinstance(capabilities, dict) and "available" in capabilities else {}
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -144,6 +173,24 @@ def _gpu_series() -> int:
         return 0
     series = [int(match.group(1)) for match in re.finditer(r"GeForce\s+RTX\s+(\d{2})\d{2}", result.stdout, re.IGNORECASE)]
     return max(series, default=0)
+
+
+@lru_cache(maxsize=1)
+def _gpu_identity() -> tuple[str, ...]:
+    """Return the cached GPU and driver identity used by probe signatures."""
+    if os.name != "nt":
+        return ()
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if result.returncode:
+        return ()
+    return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
 def is_rtx_50_series() -> bool:
@@ -165,8 +212,17 @@ def _hags_enabled() -> bool | None:
 
 
 def unavailable_reason(*, temporal: bool) -> str:
-    if os.name != "nt" or sys.getwindowsversion().build < 22000:
-        return "Windows 11 required"
+    if not temporal and uses_experimental_backend():
+        from .experimental import installation_error
+        reason = installation_error(RUNTIME / "direct")
+        return reason or ("RTX 30+ required" if _gpu_series() < 30 else "")
+    if os.name != "nt":
+        return "Windows 10 20H1 (build 19041) or newer required" if temporal else "Windows 11 or the opt-in experimental Windows 10 backend required"
+    windows_build = sys.getwindowsversion().build
+    if temporal and windows_build < 19041:
+        return "Windows 10 20H1 (build 19041) or newer required"
+    if not temporal and windows_build < 22000:
+        return "Windows 11 or the opt-in experimental Windows 10 backend required"
     missing = _missing(DLSSG_FILES if temporal else NR_FILES)
     if missing:
         return f"missing {missing[0].name}"
@@ -315,6 +371,7 @@ class Worker:
 
 class FlowGuides:
     def __init__(self, width: int, height: int, motion_vector: str):
+        import torch
         self.width, self.height = width, height
         self.use_raft = motion_vector == "raft"
         scale = min(1.0, 640 / width)
@@ -331,6 +388,7 @@ class FlowGuides:
             self.flow.setFinestScale(1)
 
     def _raft(self, current: np.ndarray) -> np.ndarray:
+        import torch
         from preprocessing.raft.utils.utils import InputPadder
 
         current_tensor = torch.from_numpy(current[..., :3]).permute(2, 0, 1).float().unsqueeze(0).to(self.device)
@@ -369,6 +427,7 @@ class FlowGuides:
 
 class DepthGuides:
     def __init__(self, width: int, height: int, depth_resolution: str):
+        import torch
         self.width, self.height = width, height
         divisor = DEPTH_RESOLUTION_DIVISORS[depth_resolution]
         self.inference_width = width // divisor
@@ -417,6 +476,7 @@ def _sample_info(sample: torch.Tensor) -> tuple[torch.dtype, torch.device, int, 
 
 
 def _frame_to_rgba(sample: torch.Tensor, index: int) -> np.ndarray:
+    import torch
     channels = sample.shape[0]
     frame = sample[:, index].detach()
     if frame.dtype != torch.uint8:
@@ -430,6 +490,7 @@ def _frame_to_rgba(sample: torch.Tensor, index: int) -> np.ndarray:
 
 
 def _from_rgba_frames(data: np.ndarray, dtype: torch.dtype, device: torch.device, channels: int) -> torch.Tensor:
+    import torch
     output = torch.from_numpy(data).permute(3, 0, 1, 2)
     if channels == 3:
         output = output[:3]
@@ -448,14 +509,15 @@ class NeuralRenderingSession(Worker):
     FRAME_MAGIC = 0x314D5246
     OUT_MAGIC = 0x3154554F
 
-    def __init__(self, width: int, height: int, frames: int, scale: float, intensity: float = 1.0, abort_callback=None):
+    def __init__(self, width: int, height: int, frames: int, scale: float, intensity: float = 1.0, abort_callback=None, *, host_dir: Path | None = None):
         output_width = max(2, math.floor(width * scale / 2 + 0.5) * 2)
         output_height = max(2, math.floor(height * scale / 2 + 0.5) * 2)
         if max(output_width, output_height) > 7680 or min(output_width, output_height) > 4320:
             raise ValueError(f"DLSS output {output_width}x{output_height} exceeds the 7680x4320 limit")
         intensity = max(0.0, min(2.0, float(intensity)))
-        command = [str(NR_WORKER), "--nr-intensity", f"{intensity:.4f}", "--wangp-video"] if USE_DEPTH_GUIDE else [str(NR_WORKER), "--video"]
-        super().__init__(command, HOST_DIR, abort_callback)
+        worker = host_dir / "nr-depth-worker.exe" if host_dir is not None else NR_WORKER
+        command = [str(worker), "--nr-intensity", f"{intensity:.4f}", "--wangp-video"] if USE_DEPTH_GUIDE else [str(worker), "--video"]
+        super().__init__(command, host_dir or HOST_DIR, abort_callback)
         self.output_width, self.output_height = output_width, output_height
         assert self.process.stdin is not None and self.process.stdout is not None
         if USE_DEPTH_GUIDE:
@@ -499,16 +561,185 @@ class NeuralRenderingSession(Worker):
         return self.read_array((self.output_height, self.output_width, 4), output)
 
 
+def create_neural_session(width, height, frames, scale, intensity=1.0, abort_callback=None, *, still_image=False):
+    if uses_experimental_backend():
+        from .experimental import ExperimentalNeuralSession
+        return ExperimentalNeuralSession(width, height, frames, scale, intensity, abort_callback,
+                                         still_image=still_image, runtime_dir=RUNTIME / "direct")
+    from .alignment import AlignedNeuralSession
+    return AlignedNeuralSession(
+        width, height, frames, scale, intensity, abort_callback,
+        session_factory=NeuralRenderingSession,
+    )
+
+
+def clear_neural_rendering_probe_cache() -> None:
+    """Invalidate DLSS-NR readiness after the user explicitly refreshes it."""
+    global _nr_probe_epoch
+    with _nr_probe_cache_lock:
+        _nr_probe_epoch += 1
+        _nr_probe_cache.clear()
+
+
+def _neural_rendering_probe_signature() -> tuple:
+    try:
+        build = int(sys.getwindowsversion().build)
+    except (AttributeError, OSError, TypeError, ValueError):
+        build = 0
+    experimental = uses_experimental_backend()
+    if experimental:
+        from .experimental import HASHES
+        paths = tuple(RUNTIME / "direct" / name for name in HASHES)
+    else:
+        paths = NR_FILES
+    file_signature = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            file_signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            file_signature.append((str(path), None, None))
+    return (os.name, build, experimental, _gpu_series(), _gpu_identity(),
+            tuple(file_signature), NR_PROBE_GEOMETRY)
+
+
+def _deferred_neural_rendering_probe(reason: str) -> dict:
+    return {"available": False, "reason": reason, "deferred": True}
+
+
+def neural_rendering_capabilities(*, allow_probe: bool = True) -> dict:
+    """Check NR readiness with one bounded, unaligned synthetic upscale.
+
+    A busy generation queue and concurrent probe return a transient deferred
+    result, which is never cached. Actual success and failure are cached by
+    hardware/runtime signature until the explicit capability refresh clears it.
+    """
+    static_reason = unavailable_reason(temporal=False)
+    if static_reason:
+        return {"available": False, "reason": static_reason, "deferred": False}
+    # Keep the established opt-in Windows 10 capability policy. The bounded
+    # synthetic evaluation check is for the standard Windows 11 worker bundle.
+    if uses_experimental_backend():
+        return {"available": True, "reason": "", "deferred": False}
+
+    signature = _neural_rendering_probe_signature()
+    global _nr_probe_epoch
+    with _nr_probe_cache_lock:
+        cached = _nr_probe_cache.get(signature)
+        epoch = _nr_probe_epoch
+    if cached is not None:
+        return dict(cached)
+    if not allow_probe:
+        return _deferred_neural_rendering_probe(
+            "DLSS Neural Rendering has not passed an evaluation-frame check. "
+            "Open Media Flow and use Refresh while Maestro is idle before starting a long job."
+        )
+    if not _nr_probe_lock.acquire(blocking=False):
+        return _deferred_neural_rendering_probe(
+            "DLSS Neural Rendering readiness is already being checked. Wait for that check or refresh again while Maestro is idle."
+        )
+
+    try:
+        with _nr_probe_cache_lock:
+            cached = _nr_probe_cache.get(signature)
+            epoch = _nr_probe_epoch
+        if cached is not None:
+            return dict(cached)
+
+        try:
+            from services.job_lifecycle import idle_generation_probe
+        except ImportError:
+            return _deferred_neural_rendering_probe(
+                "DLSS Neural Rendering readiness could not verify that Maestro is idle. "
+                "Retry Refresh from the running Maestro server."
+            )
+
+        with idle_generation_probe() as busy_reason:
+            if busy_reason:
+                return _deferred_neural_rendering_probe(
+                    "DLSS Neural Rendering was not checked because "
+                    f"{busy_reason}. Retry Refresh when the generation queue is idle."
+                )
+            deadline = time.monotonic() + NR_PROBE_TIMEOUT_SECONDS
+            session = None
+            succeeded = False
+            try:
+                probe_width, probe_height, probe_scale = NR_PROBE_GEOMETRY
+                expected_width = max(2, math.floor(probe_width * probe_scale / 2 + 0.5) * 2)
+                expected_height = max(2, math.floor(probe_height * probe_scale / 2 + 0.5) * 2)
+                session = create_neural_session(
+                    probe_width, probe_height, 1, probe_scale, 1.0,
+                    abort_callback=lambda: time.monotonic() >= deadline,
+                    still_image=True,
+                )
+                width, height = session.render_width, session.render_height
+                y, x = np.indices((height, width), dtype=np.uint16)
+                rgba = np.empty((height, width, 4), dtype=np.uint8)
+                rgba[..., 0] = (x * 2) % 256
+                rgba[..., 1] = (y * 2) % 256
+                rgba[..., 2] = (x + y) % 256
+                rgba[..., 3] = 255
+                motion = np.zeros((height, width, 2), dtype=np.float16)
+                depth = (1.0 + (x.astype(np.float32) + y.astype(np.float32)) / max(1, width + height))
+                output = session.process_frame(
+                    0, rgba, motion, True,
+                    depth=depth if getattr(session, "needs_guides", True) else None,
+                )
+                if (
+                    not isinstance(output, np.ndarray)
+                    or output.dtype != np.uint8
+                    or output.shape != (expected_height, expected_width, 4)
+                    or (session.output_width, session.output_height) != (expected_width, expected_height)
+                ):
+                    raise RuntimeError("DLSS Neural Rendering returned an invalid evaluation frame")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("DLSS Neural Rendering evaluation-frame check timed out")
+                session.close(abort=False)
+                session = None
+                succeeded = True
+                result = {"available": True, "reason": "", "deferred": False}
+            except Exception as error:
+                if time.monotonic() >= deadline or isinstance(error, TimeoutError):
+                    reason = (
+                        "DLSS Neural Rendering evaluation-frame check timed out after "
+                        f"{int(NR_PROBE_TIMEOUT_SECONDS)} seconds. Check the installed DLSS runtime and "
+                        "NVIDIA driver, then retry Refresh while Maestro is idle."
+                    )
+                else:
+                    detail = str(error).strip() or type(error).__name__
+                    reason = (
+                        "Native DLSS Neural Rendering failed its evaluation-frame check:\n"
+                        f"{detail}\nCheck the pinned runtime/driver compatibility and "
+                        "app/dlss5/host/ReShade.log, then retry Refresh while Maestro is idle."
+                    )
+                result = {"available": False, "reason": reason, "deferred": False}
+            finally:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        session.close(abort=not succeeded)
+
+        with _nr_probe_cache_lock:
+            if _nr_probe_epoch == epoch:
+                _nr_probe_cache.clear()
+                _nr_probe_cache[signature] = dict(result)
+        return result
+    finally:
+        _nr_probe_lock.release()
+
+
 def neural_render(sample: torch.Tensor, scale: float, *, still_image: bool, depth_resolution: str, motion_vector: str, intensity: float = 1.0, abort_callback=None, progress_callback=None) -> torch.Tensor | None:
     require_runtime(temporal=False)
     dtype, device, channels, frame_count, height, width = _sample_info(sample)
-    session = NeuralRenderingSession(width, height, frame_count, scale, intensity, abort_callback)
+    session = create_neural_session(width, height, frame_count, scale, intensity, abort_callback, still_image=still_image)
     completed = False
     try:
         output = np.empty((frame_count, session.output_height, session.output_width, 4), dtype=np.uint8)
-        flow_guides = None if still_image else FlowGuides(session.render_width, session.render_height, motion_vector)
+        needs_guides = getattr(session, "needs_guides", True)
+        # Direct same-size NR computes its motion in NVOFA. DIS is used here
+        # only for the shared scene-cut reset, without loading RAFT/depth.
+        flow_guides = None if still_image else FlowGuides(session.render_width, session.render_height, motion_vector if needs_guides else "original")
         zero_motion = np.zeros((session.render_height, session.render_width, 2), dtype=np.float16) if still_image else None
-        depth_guides = DepthGuides(session.render_width, session.render_height, depth_resolution) if USE_DEPTH_GUIDE else None
+        depth_guides = DepthGuides(session.render_width, session.render_height, depth_resolution) if USE_DEPTH_GUIDE and needs_guides else None
         for index in range(frame_count):
             if abort_callback is not None and abort_callback():
                 return None
@@ -531,6 +762,7 @@ def neural_render(sample: torch.Tensor, scale: float, *, still_image: bool, dept
         try:
             session.close(abort=not completed)
         finally:
+            from shared.utils import offload_registry
             offload_registry.unload_vram(list(_GUIDE_OFFLOADS))
     return _from_rgba_frames(output, dtype, device, channels)
 
@@ -604,6 +836,7 @@ def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: f
         try:
             session.close(abort=not completed)
         finally:
+            from shared.utils import offload_registry
             offload_registry.unload_vram(list(_GUIDE_OFFLOADS))
     return output
 

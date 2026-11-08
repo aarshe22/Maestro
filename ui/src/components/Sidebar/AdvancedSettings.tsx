@@ -4,6 +4,10 @@ import { Save, Trash2, FolderOpen, SlidersHorizontal, ChevronDown } from 'lucide
 import { useStore } from '../../stores/useStore'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
+import { Qwen21Controls } from './Qwen21Controls'
+import { KreaIdentityControls } from './KreaIdentityControls'
+import { FishSpeechSampling } from './FishSpeechSampling'
+import { SpeechWriterSettings } from './SpeechWriterSettings'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
 import { Yue2LoraSelector } from './Yue2LoraSelector'
 import { selectedMusicStyles } from '../../lib/musicStyles'
@@ -11,9 +15,16 @@ import { WindowSettings } from './DurationSlider'
 import { DirectorH3Optimizations } from './DirectorH3Optimizations'
 import { H3MediaControls } from './H3MediaControls'
 import { MiniMaxH3Optimizations } from './MiniMaxH3Optimizations'
+import { directorH3SlaEnabled } from '../../lib/h3Attention'
 import { AutomaticFaceRefiner } from '../Characters/FaceRefiner'
 import { SidebarDialog } from './SidebarPanels'
 import type { GenerateParams } from '../../types'
+import {
+  activeKreaIdentityLabels,
+  countKreaIdentityReferences,
+  isKreaIdentityEdit,
+  KREA_IDENTITY_SETTING_KEYS,
+} from '../../lib/kreaIdentityControls'
 
 const H3_LONG_SEQUENCE_EXPERIMENTS = [
   {
@@ -251,6 +262,8 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   const directorVideoModel = useStore(s => s.selectedModelPerMode.video || '')
   const directorTurboMode = useStore(s => s.directorH3TurboModeByModel)
   const directorSolMode = useStore(s => s.directorH3SolModeByModel)
+  const directorSlaMode = useStore(s => s.directorH3SlaModeByModel)
+  const directorVedaMode = useStore(s => s.directorH3VedaModeByModel)
   const directorFirstBlockCache = useStore(s => s.directorH3FirstBlockCacheByModel)
   const spatialUpsampling = useStore(s => s.spatialUpsampling)
   const filmGrainIntensity = useStore(s => s.filmGrainIntensity)
@@ -259,6 +272,12 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   const slidingWindowLocked = useStore(s => s.slidingWindowLocked)
   const servicesConfig = useStore(s => s.servicesConfig)
   const studioVideoWorkflow = useStore(s => s.studioVideoWorkflow)
+  const studioImageWorkflow = useStore(s => s.studioImageWorkflow)
+  const imageRefCount = useStore(s => s.imageRefs.length)
+  const imageSourcePresent = useStore(s => Boolean(
+    s.imageWorkflowSourcePath || s.imageWorkflowSourceFile
+    || (Number(s.params.image_mode) === 2 && (s.params.image_start || s.params.image_guide)),
+  ))
   const hasVoiceClone = useStore(s => s.voiceCloneEnabled && s.voiceCloneRefs.some(reference => !!reference?.path))
   const selectedModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
   const isScailEdit = (
@@ -270,12 +289,16 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   const items: Record<AdvancedSectionKey, string[]> = { performance: [], finishing: [], loras: [], generation: [] }
   if (sidebarMode === 'director') {
     if (directorTurboMode[directorVideoModel] === true) items.performance.push('H3 Turbo')
-    if (directorSolMode[directorVideoModel] === true) {
-      items.performance.push(
-        directorVideoModel.includes('fused_turbo')
-          ? 'H3 SLA'
-          : 'H3 Sol Engine',
-      )
+    const fused = directorVideoModel.includes('fused_turbo')
+    if (directorVedaMode[directorVideoModel] === true) {
+      items.performance.push('H3 Veda')
+    } else if (directorH3SlaEnabled(
+      { sla_attention: true, sla_attention_default: fused },
+      directorVideoModel, directorSlaMode, directorSolMode,
+    )) {
+      items.performance.push('H3 SLA')
+    } else if (!fused && directorSolMode[directorVideoModel] === true) {
+      items.performance.push('H3 Sol Engine')
     }
     if (directorFirstBlockCache[directorVideoModel] === true) items.performance.push('First Block Cache')
     return items
@@ -284,9 +307,23 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   if (String(modelOptions?.architecture || '').startsWith('minimax_h3')) {
     if (params.minimax_h3_turbo_mode && modelOptions?.minimax_h3_turbo) items.performance.push('H3 Turbo')
     if (params.override_attention === 'sol') items.performance.push('H3 Sol Engine')
-    if (params.override_attention === 'sla') items.performance.push('H3 SLA')
+    if (params.override_attention === 'sage2') items.performance.push('Sage2')
+    if (params.override_attention === 'sla') items.performance.push(modelOptions?.minimax_h3_pika_flex && modelOptions.sla_attention_status?.supported !== true ? 'H3 SLA (dense fallback)' : 'H3 SLA')
+    if (params.override_attention === 'veda') items.performance.push('H3 Veda')
     if (params.skip_steps_cache_type === 'first_block') items.performance.push('First Block Cache')
     if (generationMode !== 'audio' && params.custom_settings?.audio_refinement === 'enabled') items.finishing.push('Audio refinement')
+  }
+  const kreaModel = selectedModel || { model_type: params.model_type, architecture: modelOptions?.architecture }
+  if (generationMode === 'image' && isKreaIdentityEdit(kreaModel)) {
+    const referenceCount = countKreaIdentityReferences({
+      generationMode,
+      workflow: studioImageWorkflow,
+      imageMode: params.image_mode,
+      sourceImagePresent: imageSourcePresent,
+      referenceCount: imageRefCount,
+      editReferencesSupported: modelOptions?.image_ref_inpaint === true,
+    })
+    items.generation.push(...activeKreaIdentityLabels(params.custom_settings, referenceCount))
   }
   if (generationMode === 'video' && params.face_refiner?.enabled) items.finishing.push('Face refinement')
   if (generationMode === 'video' && params.temporal_upsampling) items.finishing.push(`Smoothing (${params.temporal_upsampling})`)
@@ -345,7 +382,10 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   ) items.generation.push('Negative prompt')
   if (params.model_type === 'yue2') items.loras.push(...(instrumental
     ? ['YuE2 instrumental LoRA'] : selectedMusicStyles(params.custom_settings).map(() => 'YuE2 music LoRA')))
-  if (params.model_type !== 'yue2' && !modelOptions?.loras_disabled && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
+  if (params.model_type !== 'yue2' && !modelOptions?.loras_disabled
+    && (!modelOptions?.experimental_loras_available || params.minimax_h3_experimental_loras === true)
+    && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
+    if (modelOptions?.experimental_loras_available) items.loras.push('Experimental LoRAs')
     for (const l of params.activated_loras) items.loras.push(`LoRA: ${l.replace(/\.(safetensors|sft)$/i, '')}`)
   }
   if (!isScailEdit && generationMode !== 'audio' && spatialUpsampling) items.finishing.push(`Upscaling (${spatialUpsampling})`)
@@ -451,9 +491,11 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
   const editSubMode = useStore(s => s.editSubMode)
   const audioSubMode = useStore(s => s.audioSubMode)
   const isAudio = generationMode === 'audio'
+  const isImage = generationMode === 'image'
   const isSfx = isAudio && audioSubMode === 'sfx'
   const isAudioOnly = modelOptions?.audio_only || isSfx
   const isVideo = generationMode === 'video'
+  const isTitles = useStore(s => s.generationMode === 'video' && s.studioVideoWorkflow === 'titles')
   const isAvatar = generationMode === 'avatar'
   const isOutpaint = isAvatar && editSubMode === 'outpaint'
   const isRecast = isAvatar && editSubMode === 'recast'
@@ -483,7 +525,14 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
     || !!modelOptions?.minimax_h3_text_encoder_choices?.length || !!modelOptions?.ltx25_video_vae_choices?.length
   const hasFinishing = !isAudio && (!isScailEdit || (isH3 && !modelOptions?.audio_only))
   const isYue2 = params.model_type === 'yue2'
+  const isKreaImageEdit = isImage && isKreaIdentityEdit({
+    model_type: params.model_type,
+    architecture: modelOptions?.architecture,
+  })
+  const experimentalLorasAvailable = modelOptions?.experimental_loras_available === true
+  const experimentalLorasEnabled = params.minimax_h3_experimental_loras === true
   const canUseLoras = !isYue2 && !isOutpaint && !modelOptions?.loras_disabled
+    && (!experimentalLorasAvailable || experimentalLorasEnabled)
   const showH3LongSequenceExperiments = (
     H3_LONG_SEQUENCE_TESTS_VISIBLE
     && isVideo
@@ -518,6 +567,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
         : !modelOptions?.lock_guidance_scale
     )
   )
+  const qwenTurboProfile = modelOptions?.qwen21_acceleration_profiles?.[String(params.sample_solver || '')]
   const showNegativePrompt = (
     !modelOptions?.no_negative_prompt
     && (!isScailEdit || isScailHq)
@@ -593,8 +643,25 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
 
               {/* Presets belong with the creative adapter controls so users can
                   save or restore a setup before adjusting its LoRAs. */}
-              <AdvancedSection section="loras" title={canUseLoras || isYue2 ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
+              <AdvancedSection section="loras" title={canUseLoras || isYue2 || experimentalLorasAvailable ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
               <PresetManager />
+
+              {experimentalLorasAvailable && <div className="mb-3 rounded-lg border border-border bg-bg-tertiary px-2.5 py-2">
+                <label className="flex items-center gap-2 text-xs text-text-secondary">
+                  <input type="checkbox" checked={experimentalLorasEnabled}
+                    onChange={event => setParam('minimax_h3_experimental_loras', event.target.checked)}
+                    className="accent-accent-blue" />
+                  Enable LoRAs (experimental)
+                </label>
+                <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+                  {modelOptions?.minimax_h3_pika_flex
+                    ? 'Try ordinary H3 style/character LoRAs alongside the required Pika adapter. Quality and individual adapter compatibility are unverified. Pika keeps its six steps; extra Turbo/PDD/VDN/PTD and DoRA adapters are unavailable.'
+                    : 'Try ordinary H3 style/character LoRAs with FastH3. Output quality is unverified. Additional Turbo/PDD adapters remain unavailable.'}
+                </p>
+                {!experimentalLorasEnabled && params.activated_loras.length > 0 && <p className="mt-1 text-[10px] text-text-muted">
+                  Saved LoRA selections are inactive while this is off.
+                </p>}
+              </div>}
 
               {/* Keep creative adapters near the top so users can choose them
                   before working through the lower-level tuning controls.
@@ -614,11 +681,15 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
               {showReferenceDetail && modelOptions && <label className="block space-y-1.5 text-xs text-text-secondary">
                 <span>Reference detail</span>
                 <select aria-label="Reference detail" value={params.minimax_h3_reference_detail ?? modelOptions.omni_reference_detail_default ?? 'match'}
-                  onChange={event => setParam('minimax_h3_reference_detail', event.target.value as 'match' | 'max')}
+                  onChange={event => setParam('minimax_h3_reference_detail', event.target.value as 'match' | 'max' | 'ptd768')}
                   className="w-full rounded-lg border border-border bg-bg-tertiary px-2 py-2 text-xs">
                   {(modelOptions.omni_reference_detail_choices ?? [['Match output (faster)', 'match'], ['High detail (official PDD recipe)', 'max']]).map(([label, value]) => <option key={value} value={value}>{label}</option>)}
                 </select>
-                <span className="block text-[10px] text-text-muted">Match output avoids reference upscaling. High detail uses the official 2048px short-edge preparation and can require more memory and time.</span>
+                <span className="block text-[10px] text-text-muted">
+                  {(params.minimax_h3_reference_detail ?? modelOptions.omni_reference_detail_default) === 'ptd768'
+                    ? 'PTD RefAsymOPD fixes reference preparation to a 768px short edge as part of its eight-hop recipe.'
+                    : 'Match output avoids reference upscaling. High detail uses the official 2048px short-edge preparation and can require more memory and time.'}
+                </span>
               </label>}
 
               {/* The Qwen conditioner is shared by every H3 transformer.
@@ -650,6 +721,17 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                 </div>
               ) : null}
 
+              {modelOptions?.minimax_h3_video_vae_choices?.length ? (
+                <div>
+                  <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">H3 Video Decoder</label>
+                  <select aria-label="H3 Video Decoder" value={params.minimax_h3_video_vae || 'auto'}
+                    onChange={event => setParam('minimax_h3_video_vae', event.target.value as NonNullable<typeof params.minimax_h3_video_vae>)}
+                    className="w-full bg-bg-tertiary border border-border rounded px-2.5 py-1.5 text-xs text-text-primary">
+                    {modelOptions.minimax_h3_video_vae_choices.map(choice => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+                  </select>
+                  <p className="text-[9px] text-text-muted mt-1">LightVAE uses a smaller 12-layer decoder; detail may differ. Start/end frames and references keep the original encoder. H3 VAE x2 uses its dedicated decoder. Changing this reloads the model.</p>
+                </div>
+              ) : null}
               {modelOptions?.ltx25_video_vae_choices?.length ? (
                 <div>
                   <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
@@ -831,6 +913,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     </div>
                   )}
 
+                  <FishSpeechSampling />
+                  <SpeechWriterSettings />
+
                   {/* Guidance Scale */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
@@ -846,7 +931,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   </div>
 
                   {/* Auto-Split */}
-                  {modelOptions?.custom_settings_def?.map(setting => (
+                  {modelOptions?.custom_settings_def?.filter(setting => (
+                    !isKreaImageEdit || !KREA_IDENTITY_SETTING_KEYS.includes(setting.id as typeof KREA_IDENTITY_SETTING_KEYS[number])
+                  )).map(setting => (
                     <div key={setting.id}>
                       <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">{setting.name}</label>
                       <input
@@ -1139,6 +1226,8 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
 
               {/* Dedicated SCAIL edit endpoints honor this value for both
                   Fast and HQ; other distilled models retain their lock. */}
+              <Qwen21Controls />
+              <KreaIdentityControls />
               {showInferenceSteps && (
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
@@ -1151,7 +1240,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                       max={inferenceStepsMax}
                       step={1}
                       value={params.num_inference_steps}
-                      disabled={h3TurboMode}
+                      disabled={h3TurboMode || !!qwenTurboProfile}
                       onChange={e => setInferenceSteps(Number(e.target.value))}
                       className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue disabled:cursor-not-allowed disabled:opacity-50"
                     />
@@ -1159,7 +1248,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   <input
                     type="range" min={inferenceStepsMin} max={inferenceStepsMax} step={1}
                     value={params.num_inference_steps}
-                    disabled={h3TurboMode}
+                    disabled={h3TurboMode || !!qwenTurboProfile}
                     onChange={e => setInferenceSteps(Number(e.target.value))}
                     className="w-full disabled:cursor-not-allowed disabled:opacity-50"
                   />
@@ -1167,6 +1256,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     <p className="text-[9px] text-text-muted mt-0.5">
                       Turbo mode locks this preset to {params.num_inference_steps} steps.
                     </p>
+                  )}
+                  {qwenTurboProfile && (
+                    <p className="text-[9px] text-text-muted mt-0.5">The acceleration profile uses {qwenTurboProfile.steps} steps and CFG {qwenTurboProfile.guidance}.</p>
                   )}
                   {!h3TurboMode && modelOptions?.inference_steps_help && (
                     <p className="text-[9px] text-text-muted mt-0.5">
@@ -1190,6 +1282,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     <input
                       type="number"
                       value={params.guidance_scale}
+                      disabled={!!qwenTurboProfile}
                       onChange={e => setParam('guidance_scale', Number(e.target.value))}
                       step={0.1}
                       className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue"
@@ -1198,6 +1291,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   <input
                     type="range" min={0} max={20} step={0.1}
                     value={params.guidance_scale}
+                    disabled={!!qwenTurboProfile}
                     onChange={e => setParam('guidance_scale', Number(e.target.value))}
                     className="w-full"
                   />
@@ -1354,7 +1448,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
               {/* Dedicated SCAIL edit endpoints own their source video,
                   edited/reference frames, masks, and process selection. */}
               {(modelOptions?.guide_preprocessing || modelOptions?.guide_custom_choices) &&
-                !isScailEdit && params.model_type !== 'viggle_animate' && !modelOptions?.minimax_h3_media_sources && (
+                !isTitles && !isScailEdit && params.model_type !== 'viggle_animate' && !modelOptions?.minimax_h3_media_sources && (
                 <ControlVideoSection />
               )}
 

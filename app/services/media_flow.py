@@ -132,17 +132,18 @@ def _temporal_frames(frames, method, fps, width, height, count, options, abort, 
 def _neural_frames(frames, scale, width, height, count, options, abort, progress):
     import cv2
     from postprocessing.dlss5 import runtime
-    prepare_dlss(options, neural=True)
-    session = runtime.NeuralRenderingSession(width, height, count, scale, options["dlss_intensity"], abort)
+    prepare_dlss(options, neural=True, scale=scale)
+    session = runtime.create_neural_session(width, height, count, scale, options["dlss_intensity"], abort)
     completed = False
     try:
-        guides = runtime.FlowGuides(session.render_width, session.render_height, options["dlss_motion"])
-        depths = runtime.DepthGuides(session.render_width, session.render_height, options["dlss_depth"])
+        needs_guides = getattr(session, "needs_guides", True)
+        guides = runtime.FlowGuides(session.render_width, session.render_height, options["dlss_motion"] if needs_guides else "original")
+        depths = runtime.DepthGuides(session.render_width, session.render_height, options["dlss_depth"]) if needs_guides else None
         for index, frame in enumerate(frames):
             _check_abort(abort)
             frame = cv2.resize(frame, (session.render_width, session.render_height), interpolation=cv2.INTER_LANCZOS4)
             motion, reset = guides.process(frame)
-            depth = depths.process(frame, reset)
+            depth = depths.process(frame, reset) if depths is not None else None
             _check_abort(abort)
             yield session.process_frame(index, frame, motion, reset, depth=depth)
             if progress:
@@ -284,3 +285,25 @@ def process_video(source, destination, *, spatial="", temporal="", options=None,
         if (spatial or "").startswith("dlss") or temporal.startswith("dlss"):
             from postprocessing.dlss5.runtime import release_flow_model
             release_flow_model()
+
+
+def process_generation_video(source, destination, *, spatial="", temporal="",
+                             options=None, abort=None, progress=None):
+    """Apply optional Studio finishing and atomically replace its source.
+
+    Tools and standalone Media Flow continue to call :func:`process_video`
+    directly and retain its failure behavior. This Studio-only helper leaves
+    the generated original untouched unless processing completes, propagates
+    cancellation, and always removes the temporary output.
+    """
+    try:
+        result = process_video(
+            source, destination, spatial=spatial, temporal=temporal,
+            options=options, abort=abort, progress=progress,
+        )
+        _check_abort(abort)
+        os.replace(destination, source)
+        return result
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(destination)

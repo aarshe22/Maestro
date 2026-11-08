@@ -1,8 +1,12 @@
 """Pinokio launcher regressions that do not require the application runtime."""
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import unittest
 
 
@@ -10,6 +14,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
+    def test_web_icon_route_resolves_the_moved_tracked_asset(self):
+        launcher = (_ROOT / "app" / "launch.py").read_text(encoding="utf-8")
+        icon = _ROOT / "docs" / "images" / "maestro-icon.png"
+
+        self.assertTrue(icon.is_file())
+        self.assertIn(
+            'os.path.join(_app_dir, "..", "docs", "images", "maestro-icon.png")',
+            launcher,
+        )
+        self.assertIn('@api.get("/maestro-icon.png", include_in_schema=False)', launcher)
+        self.assertIn("return FileResponse(", launcher)
+
     def test_installed_app_menu_is_not_hidden_by_early_gpu_detection(self):
         launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
 
@@ -47,23 +63,99 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn('"event": "/Incorrect version of mmgp/i"', start)
         self.assertIn('"break": true', start)
 
-    def test_mmgp_startup_guard_matches_the_pinned_requirement(self):
+    def test_selected_mmgp_runtime_resolves_to_its_bundled_package(self):
         requirements = (_ROOT / "app" / "requirements.txt").read_text(
             encoding="utf-8"
         )
         engine = (_ROOT / "app" / "wgp.py").read_text(encoding="utf-8")
-        pinned = re.search(r"(?m)^mmgp==([^\s#]+)", requirements)
-        guarded = re.search(
-            r'^target_mmgp_version\s*=\s*["\']([^"\']+)["\']',
+        app_dir = _ROOT / "app"
+        self.assertFalse(re.search(r"(?m)^mmgp\s*[<=>!~]", requirements))
+        self.assertIn(
+            "from services.memory_runtime import read_saved_runtime, select_runtime",
             engine,
-            re.MULTILINE,
         )
-        self.assertIsNotNone(pinned)
-        self.assertIsNotNone(guarded)
-        self.assertEqual(guarded.group(1), pinned.group(1))
+        selected = engine.index("memory_runtime_selection = select_runtime(")
+        imported = engine.index("import mmgp")
+        verified = engine.index("verify_runtime_import(memory_runtime_selection, mmgp)")
+        self.assertLess(selected, imported)
+        self.assertLess(imported, verified)
+        self.assertRegex(
+            engine,
+            r'target_mmgp_version\s*=\s*\(\s*"4\.0\.0"\s*if\s+'
+            r'memory_runtime_selection\.backend\s*==\s*"legacy"\s*else\s*"4\.4\.0"\s*\)',
+        )
+
+        runtimes = (
+            ("legacy", app_dir / "mmgp", "4.0.0"),
+            ("wangp9905", app_dir / "mmgp_backends" / "v43" / "mmgp", "4.4.0"),
+        )
+        for _backend, package_dir, expected_version in runtimes:
+            package_file = package_dir / "__init__.py"
+            self.assertTrue(package_file.is_file())
+            package_source = package_file.read_text(encoding="utf-8")
+            self.assertRegex(
+                package_source,
+                rf'(?m)^__version__\s*=\s*["\']{re.escape(expected_version)}["\']',
+            )
+
+        legacy_metadata = (app_dir / "mmgp" / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"allocator/*.dll"', legacy_metadata)
+        self.assertIn('"allocator/*.so"', legacy_metadata)
+        for filename in (
+            "oom_error_linux_x86_64.so",
+            "oom_error_win_amd64.dll",
+            "vmm_alloc_linux_x86_64.so",
+            "vmm_alloc_win_amd64.dll",
+        ):
+            self.assertTrue((app_dir / "mmgp" / "allocator" / filename).is_file())
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(app_dir), env.get("PYTHONPATH", "")]
+        ).rstrip(os.pathsep)
+        probe_source = (
+            "import json, sys; "
+            "from services.memory_runtime import select_runtime, verify_runtime_import; "
+            "selection = select_runtime(sys.argv[1], sys.argv[2]); "
+            "import mmgp; "
+            "print('__MMGP_RUNTIME_RESULT__' + json.dumps([mmgp.__file__, "
+            "verify_runtime_import(selection, mmgp)]))"
+        )
+        for backend, package_dir, expected_version in runtimes:
+            with self.subTest(backend=backend):
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        probe_source,
+                        str(app_dir),
+                        backend,
+                    ],
+                    cwd=_ROOT,
+                    env=env,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                result_lines = [
+                    line for line in probe.stdout.splitlines()
+                    if line.startswith("__MMGP_RUNTIME_RESULT__")
+                ]
+                self.assertEqual(len(result_lines), 1, probe.stdout)
+                imported_path, imported_version = json.loads(
+                    result_lines[0].removeprefix("__MMGP_RUNTIME_RESULT__")
+                )
+                self.assertEqual(
+                    Path(imported_path).resolve(),
+                    (package_dir / "__init__.py").resolve(),
+                )
+                self.assertEqual(imported_version, expected_version)
 
     def test_rtx50_uses_an_isolated_cuda13_runtime(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
         torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
 
@@ -80,7 +172,7 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn("Repair H3 Performance Runtime", menu)
 
     def test_legacy_windows_flash_wheel_matches_wangp_documented_abi(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
 
         self.assertIn("flash_attn-2.7.4.post1+cu128torch2.7.0", torch_script)
@@ -92,7 +184,7 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn("uses SageAttention/SDPA", torch_script)
 
     def test_update_can_resume_a_missing_hardware_runtime(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         updater = (_ROOT / "update.js").read_text(encoding="utf-8")
 
         self.assertIn("alreadyCurrentAndReady", updater)

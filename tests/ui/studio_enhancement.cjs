@@ -5,9 +5,22 @@ const screenshotPath = name => path.resolve(__dirname, '../../.codex-tmp/sidebar
 
 async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
   const prompt = sidebar.getByRole('textbox', {name: 'Generation prompt'});
-  const main = sidebar.getByRole('button', {name: 'Enhance prompt', exact: true});
-  const choices = sidebar.getByRole('button', {name: 'Prompt enhancement options'});
+  const promptTools = sidebar.getByRole('group', {name: 'Prompt controls', exact: true});
+  const main = promptTools.getByRole('button', {name: 'Enhance prompt', exact: true});
+  const choices = promptTools.getByRole('button', {name: 'Prompt enhancement options'});
+  const badge = sidebar.locator('.studio-prompt-field > button[aria-label="Remove Enhance on generation"]');
   const isArmed = () => page.evaluate(() => window.shouldEnhanceOnGeneration(window.store.getState()));
+  const assertPromptBadge = async () => {
+    await badge.waitFor();
+    assert.deepEqual(await page.evaluate(() => {
+      const field = document.querySelector('.studio-prompt-field');
+      const prompt = field?.querySelector('textarea[aria-label="Generation prompt"]');
+      const badge = field?.querySelector(':scope > button[aria-label="Remove Enhance on generation"]');
+      const footer = document.querySelector('[data-studio-footer]');
+      return {insidePromptField: !!field && !!prompt && !!badge && badge.parentElement === prompt.parentElement,
+        outsideFooter: !!badge && !!footer && !footer.contains(badge)};
+    }), {insidePromptField: true, outsideFooter: true}, 'Enabled enhancement has a removable badge attached to the prompt');
+  };
   const enhance = async (fromMenu = false) => {
     const style = await page.evaluate(() => String(window.store.getState().modelOptions?.architecture || '').startsWith('minimax_h3') ? 'adaptive' : 'faithful');
     const before = llmRequests.length;
@@ -73,7 +86,7 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
       assert.equal(provenance.original_prompt, verbatim, 'Repeated enhancement retains the source');
       assert.equal(provenance.enhanced_prompt, await prompt.inputValue());
       await page.evaluate(() => window.store.getState().startGeneration('queue'));
-      assert.deepEqual(requests.at(-1)._prompt_enhancement, provenance, 'Generation carries source into saved image metadata');
+      assert.deepEqual(requests.at(-1)._prompt_enhancement, JSON.parse(JSON.stringify(provenance)), 'Generation carries source into saved image metadata');
       await prompt.fill('A different image brief.');
       assert.equal(await page.evaluate(() => window.store.getState().params._prompt_enhancement), undefined, 'A new brief cannot inherit an unrelated source');
       await page.evaluate(provenance => {
@@ -128,8 +141,12 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
     await review.locator('textarea[title]').first().fill('My exact first window revision.');
     await review.getByRole('button', {name: 'Done', exact: true}).click();
     const afterEnhance = llmRequests.length;
+    let submittedRequests = requests.length;
     for (const action of ['queue', 'now']) {
       await page.evaluate(action => window.store.getState().startGeneration(action), action);
+      assert.equal(requests.length, submittedRequests + 1,
+        `${id} ${action} submits the reviewed H3 plan; ${await page.evaluate(() => window.store.getState().promptEnhanceError || 'no Studio error')}`);
+      submittedRequests++;
       assert.equal(requests.at(-1)._h3_window_plan_reviewed, true);
       assert.equal(requests.at(-1).h3_window_prompts[0], 'My exact first window revision.');
       assert.equal(requests.at(-1).minimax_h3_sequence_prompt_mode, 'adaptive');
@@ -147,6 +164,105 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
     assert.equal(requests.at(-1).h3_window_prompts[0], 'Manual window 1.');
     assert.equal(llmRequests.length, afterEnhance);
   }
+
+  // H3 Frames planning and submission share one canonical schedule. Restored
+  // overlap 17 normalizes to 18; the 336-frame story stays three windows
+  // through a harmless same-model options refresh and preserves reviewed edits.
+  await reset('minimax_h3_fused_turbo', 'video', 'frames');
+  await page.evaluate(() => {
+    const s = window.store.getState();
+    window.store.setState({durationSeconds: 14, slidingWindowSeconds: 124 / 24, slidingWindowOverlap: 17, slidingWindowLocked: true,
+      startImage: null, endImage: null,
+      params: {...s.params, prompt: 'A brief story told in three connected scenes.', image_mode: 0,
+        image_start: undefined, image_end: undefined, video_length: 336, sliding_window_size: 124,
+        sliding_window_overlap: 17, minimax_h3_multi_window: true, minimax_h3_window_storyboard: true,
+        custom_settings: {}, _duration_planning_mode: 'duration'}});
+  });
+  const timingPlanCalls = llmRequests.length;
+  await enhance();
+  const timingRequest = llmRequests.at(-1);
+  const timingState = await page.evaluate(() => {
+    const s = window.store.getState();
+    return {generationMode: s.generationMode, workflow: s.studioVideoWorkflow, model: s.params.model_type,
+      pacing: s.modelOptions?.sliding_window_auto_prompt_pacing, multi: s.params.minimax_h3_multi_window,
+      storyboard: s.params.minimax_h3_window_storyboard, imageMode: s.params.image_mode,
+      totalFrames: s.params.video_length, windowFrames: s.params.sliding_window_size,
+      overlap: s.params.sliding_window_overlap};
+  });
+  assert.equal(timingRequest.endpoint, '/api/v1/llm/plan-h3-windows', JSON.stringify(timingState));
+  assert.deepEqual({total: timingRequest.total_frames, window: timingRequest.window_frames,
+    overlap: timingRequest.overlap_frames, discard: timingRequest.discard_frames,
+    multi: timingRequest.minimax_h3_multi_window, custom: timingRequest.custom_settings},
+  {total: 336, window: 124, overlap: 18, discard: 0, multi: true, custom: {}});
+  assert.equal(llmRequests.length, timingPlanCalls + 1);
+  assert.deepEqual(await page.evaluate(() => {
+    const s = window.store.getState();
+    return {frames: s.params.video_length, duration: s.durationSeconds,
+      overlap: s.params.sliding_window_overlap, windows: s.h3WindowPlan?.windows.map(w => [w.start_frame, w.end_frame])};
+  }), {frames: 336, duration: 14, overlap: 18, windows: [[0, 124], [124, 230], [230, 336]]});
+
+  await page.evaluate(() => window.store.getState().updateH3WindowPrompt(0, 'Keep this reviewed opening exactly.'));
+  await page.evaluate(async () => window.store.getState().loadModelOptions('minimax_h3_fused_turbo'));
+  assert.deepEqual(await page.evaluate(() => {
+    const s = window.store.getState();
+    return {frames: s.params.video_length, duration: s.durationSeconds,
+      prompt: s.h3WindowPlan?.windows[0]?.prompt, overlap: s.slidingWindowOverlap};
+  }), {frames: 336, duration: 14, prompt: 'Keep this reviewed opening exactly.', overlap: 18},
+  'A same-model options refresh keeps a valid reviewed Frames plan and its timing');
+  const beforeReviewedSubmit = requests.length;
+  await page.evaluate(() => window.store.getState().startGeneration('queue'));
+  assert.equal(requests.length, beforeReviewedSubmit + 1);
+  assert.deepEqual({frames: requests.at(-1).video_length, window: requests.at(-1).sliding_window_size,
+    overlap: requests.at(-1).sliding_window_overlap, discard: requests.at(-1).sliding_window_discard_last_frames,
+    count: requests.at(-1).h3_window_prompts?.length, reviewed: requests.at(-1)._h3_window_plan_reviewed,
+    opening: requests.at(-1).h3_window_prompts?.[0]},
+  {frames: 336, window: 124, overlap: 18, discard: 0, count: 3, reviewed: true,
+    opening: 'Keep this reviewed opening exactly.'});
+
+  // A restored reviewed plan with the same window count but different spans
+  // must fail preflight rather than submit prompts against a changed schedule.
+  await page.evaluate(() => {
+    const s = window.store.getState();
+    const plan = s.h3WindowPlan;
+    window.store.setState({h3WindowPlan: {...plan, windows: plan.windows.map((window, index) => (
+      index === 0 ? {...window, end_frame: window.end_frame + 1} : window
+    ))}});
+  });
+  const beforeStaleSubmit = requests.length;
+  await page.evaluate(() => window.store.getState().startGeneration('queue'));
+  assert.equal(requests.length, beforeStaleSubmit);
+  assert.match(await page.evaluate(() => window.store.getState().promptEnhanceError), /timing.*Press Enhance/);
+
+  // An enabled multi-window toggle is not enough by itself: a single selected
+  // pass still uses the native 345-frame length repair.
+  const beforeSinglePass = requests.length;
+  await page.evaluate(async () => {
+    const s = window.store.getState();
+    window.store.setState({jobs: [], isGenerating: false, h3WindowPlan: null, slidingWindowLocked: false,
+      durationSeconds: 14, slidingWindowSeconds: 345 / 24, slidingWindowOverlap: 18,
+      params: {...s.params, prompt: 'One native pass.', video_length: 336, sliding_window_size: 345,
+        sliding_window_overlap: 18, minimax_h3_multi_window: true, minimax_h3_window_storyboard: true,
+        image_mode: 0, _duration_planning_mode: 'duration'}});
+    await window.store.getState().startGeneration('queue');
+  });
+  assert.equal(requests.length, beforeSinglePass + 1);
+  assert.equal(requests.at(-1).video_length, 345, 'A single native pass still rounds 336 to 345');
+
+  // A real rolling request one frame above the native ceiling must bypass both
+  // the max+1 clamp and lattice snap. Manual prompts keep this path LLM-free.
+  const beforeLongRollingSubmit = requests.length;
+  await page.evaluate(async () => {
+    const s = window.store.getState();
+    window.store.setState({jobs: [], isGenerating: false, h3WindowPlan: null, slidingWindowLocked: true,
+      durationSeconds: 346 / 24, slidingWindowSeconds: 124 / 24, slidingWindowOverlap: 18,
+      params: {...s.params, prompt: 'Window one.\nWindow two.\nWindow three.\nWindow four.',
+        video_length: 346, sliding_window_size: 124, sliding_window_overlap: 18,
+        minimax_h3_multi_window: true, minimax_h3_window_storyboard: false, image_mode: 0,
+        _duration_planning_mode: 'duration'}});
+    await window.store.getState().startGeneration('queue');
+  });
+  assert.equal(requests.length, beforeLongRollingSubmit + 1);
+  assert.equal(requests.at(-1).video_length, 346, 'A true 346-frame rolling timeline is not clamped to 345');
 
   await reset('ltx2_22B_distilled_1_1');
   await page.evaluate(() => window.store.getState().setDurationSeconds(30));
@@ -170,7 +286,7 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
     await page.evaluate(() => window.store.setState({isGenerating: true}));
     await choices.click();
     await page.getByRole('menuitemcheckbox', {name: 'Enhance on generation', exact: true}).click();
-    await sidebar.getByRole('button', {name: 'Remove Enhance on generation'}).waitFor();
+    await assertPromptBadge();
     const calls = llmRequests.length, before = requests.length;
     const accepted = page.waitForResponse(response => response.url().endsWith('/api/v1/generate'));
     await sidebar.getByRole('button', {name: action === 'queue' ? 'Add current Studio settings to the queue' : 'Generate', exact: true}).click();
@@ -194,15 +310,18 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
   assert.equal(await page.evaluate(() => window.store.getState().enhanceOnGeneration), true, 'Failed submission keeps its instruction');
   await page.unroute('**/api/v1/generate');
   await page.setViewportSize({width: 390, height: 720});
-  const badge = sidebar.getByRole('button', {name: 'Remove Enhance on generation'});
+  const mobileBadge = badge;
+  await mobileBadge.scrollIntoViewIfNeeded();
   await page.waitForFunction(() => {
-    const rect = document.querySelector('[aria-label="Remove Enhance on generation"]')?.getBoundingClientRect();
-    return rect && rect.x >= 0 && rect.right <= window.innerWidth;
+    const rect = document.querySelector('.studio-prompt-field > [aria-label="Remove Enhance on generation"]')?.getBoundingClientRect();
+    return rect && rect.width > 0 && rect.height > 0 && rect.x >= 0 && rect.right <= window.innerWidth
+      && rect.y >= 0 && rect.bottom <= window.innerHeight;
   });
-  const rect = await badge.boundingBox();
+  await assertPromptBadge();
+  const rect = await mobileBadge.boundingBox();
   assert.ok(rect && rect.x >= 0 && rect.x + rect.width <= 390, 'Armed instruction fits mobile');
   await page.screenshot({path: screenshotPath('mobile-enhance-on-generation.png')});
-  await badge.click();
+  await mobileBadge.click();
   assert.equal(await page.evaluate(() => window.store.getState().enhanceOnGeneration), false);
   await page.setViewportSize({width: 1360, height: 900});
 
@@ -234,7 +353,7 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
   assert.equal(await isArmed(), true);
   const defaultCalls = llmRequests.length;
   for (const action of ['queue', 'now']) {
-    await sidebar.getByRole('button', {name: 'Remove Enhance on generation'}).click();
+    await badge.click();
     assert.equal(await isArmed(), false);
     await page.route('**/api/v1/generate', route => route.fulfill({status: 503, json: {detail: 'Test rejection'}}));
     await page.evaluate(action => window.store.getState().startGeneration(action), action);
@@ -293,7 +412,7 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
   });
   await page.evaluate(() => {window.pendingSubmit = window.store.getState().startGeneration('queue')});
   await pendingSubmission;
-  await sidebar.getByRole('button', {name: 'Remove Enhance on generation'}).click();
+  await badge.click();
   acceptSubmission();
   await page.evaluate(() => window.pendingSubmit);
   assert.equal(await isArmed(), false, 'Late acceptance does not clear a newly chosen skip');
@@ -325,7 +444,8 @@ async function assertExplicitEnhancement(page, sidebar, requests, llmRequests) {
   await page.getByRole('button', {name: /^Generation queue,/}).first().click();
   await page.getByRole('button', {name: 'Needs attention — review prompts'}).click();
   const jobReview = page.getByRole('dialog', {name: 'Review enhanced prompts'});
-  await jobReview.getByText('The writer needs a review before generation.', {exact: true}).waitFor();
+  await jobReview.getByRole('status').getByText('Generation is paused for review. Your draft is saved.', {exact: true}).waitFor();
+  await jobReview.getByText('Review the fallback draft.', {exact: true}).waitFor();
   await jobReview.getByText('Saved enhanced scene', {exact: true}).waitFor();
   await page.setViewportSize({width: 390, height: 720});
   const reviewBounds = await jobReview.boundingBox();

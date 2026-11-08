@@ -54,8 +54,14 @@ class TraceTests(unittest.TestCase):
         import requests
         from services import llm_service as llm
         from services.studio_enhancement import enhancement_context
-        for mode in ("json", "stream", "delegate"):
-            streaming = mode != "json"
+        for mode in ("json", "json_length", "json_unknown", "stream", "delegate", "stream_length", "stream_unknown"):
+            streaming = not mode.startswith("json")
+            stream_finish_reason = {
+                "json_length": "length",
+                "json_unknown": "unknown",
+                "stream_length": "length",
+                "stream_unknown": "unknown",
+            }.get(mode, "stop")
             with self.subTest(mode=mode):
                 response = requests.Response()
                 response.status_code = 200
@@ -64,23 +70,23 @@ class TraceTests(unittest.TestCase):
                 if streaming:
                     chunks = [
                         {"choices": [{"delta": {"reasoning_content": "local thought"}}]},
-                        {"choices": [{"delta": {"content": "draft"}, "finish_reason": "stop"}], "usage": usage},
+                        {"choices": [{"delta": {"content": "draft"}, "finish_reason": stream_finish_reason}], "usage": usage},
                     ]
                     response.raw = io.BytesIO(b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks) + b"data: [DONE]\n\n")
                 else:
                     response._content = json.dumps({"choices": [{"message": {"content": "draft", "reasoning_content": "local thought"},
-                        "finish_reason": "stop"}], "usage": usage}).encode()
+                        "finish_reason": stream_finish_reason}], "usage": usage}).encode()
                 with patch.object(llm, "is_loaded", return_value=True), patch.object(llm, "_provider", "local"), \
                         patch.object(llm, "_model_id", "bench-test"), patch.object(llm, "_reset_idle_timer"), \
                         patch.object(llm, "_count_local_tokens", return_value=None), patch.object(requests, "post", return_value=response):
                     with capture() as trace, (enhancement_context({}, lambda: False) if mode == "delegate" else nullcontext()):
-                        generate = llm.generate_streaming if mode == "stream" else llm.generate
+                        generate = llm.generate_streaming if mode in {"stream", "stream_length", "stream_unknown"} else llm.generate
                         self.assertEqual(generate("test", enable_thinking=False), "draft")
                 self.assertEqual(len(trace["calls"]), 1)
                 call = trace["calls"][0]
                 self.assertEqual(call["raw_response"]["reasoning_content"], "local thought")
                 self.assertEqual(call["raw_response"]["content"], "draft")
-                self.assertTrue(call["raw_response"]["complete"])
+                self.assertEqual(call["raw_response"]["complete"], stream_finish_reason == "stop")
                 self.assertEqual(call["output"], "draft")
                 self.assertEqual(call["metrics"]["prompt_tokens"], 10)
                 self.assertFalse(call["payload"]["cache_prompt"])
@@ -194,6 +200,22 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("promptbench/rubric.md", hashes)
         self.assertIn("promptbench/operator/SKILL.md", hashes)
 
+    def test_director_and_prompt_enhancer_guide_edits_invalidate_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for category in ("enhance", "director", "prompt_enhancer"):
+                guide = root / "services" / "llm_guides" / category / "instructions.md"
+                guide.parent.mkdir(parents=True, exist_ok=True)
+                guide.write_text("Preserve the source scene.", encoding="utf-8")
+            before = source_fingerprint(root)
+            for category in ("director", "prompt_enhancer"):
+                guide = root / "services" / "llm_guides" / category / "instructions.md"
+                guide.write_text("Keep vocal ownership with the assigned visible performer.", encoding="utf-8")
+                after = source_fingerprint(root)
+                self.assertNotEqual(digest(before), digest(after), category)
+                self.assertEqual(len(after), 3)
+                before = after
+
     def test_public_reference_templates_require_private_media(self):
         path = Path(__file__).resolve().parents[1] / "app/promptbench/cases.json"
         with self.assertRaisesRegex(ValueError, "at least one image or video"):
@@ -214,6 +236,11 @@ class EvidenceTests(unittest.TestCase):
         manual = {**frames, "sliding_window_size": 260, "sliding_window_overlap": 18,
                   "sliding_window_memory_override": True}
         self.assertEqual(validate_params(manual), manual)
+        extended = {**frames, "video_length": 719, "sliding_window_size": 719,
+                    "minimax_h3_extended_duration": True}
+        self.assertEqual(validate_params(extended), extended)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            validate_params({**extended, "minimax_h3_extended_duration": "true"})
         reference = {**frames, "model_type": "minimax_h3_ref2va_fused_turbo"}
         with self.assertRaisesRegex(ValueError, "at least one image or video"):
             validate_params(reference)

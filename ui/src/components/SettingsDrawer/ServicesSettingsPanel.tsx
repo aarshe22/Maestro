@@ -1,60 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { RefreshCw, ShieldAlert, ShieldCheck, Lock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
-
-function ApiKeyField({ label, maskedValue, isSet, onSave }: {
-  label: string
-  maskedValue: string
-  isSet: boolean
-  onSave: (value: string) => void
-}) {
-  const [editing, setEditing] = useState(false)
-  const [value, setValue] = useState('')
-
-  return (
-    <div>
-      <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-        {label}
-      </label>
-      {editing ? (
-        <div className="flex gap-2">
-          <input
-            type="password"
-            value={value}
-            onChange={e => setValue(e.target.value)}
-            placeholder="Paste API key..."
-            className="flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
-            autoFocus
-          />
-          <button
-            onClick={() => { onSave(value); setEditing(false); setValue('') }}
-            className="px-3 py-2 bg-accent-blue text-white text-xs rounded-lg hover:bg-accent-blue-hover"
-          >
-            Save
-          </button>
-          <button
-            onClick={() => { setEditing(false); setValue('') }}
-            className="px-3 py-2 border border-border text-xs rounded-lg text-text-secondary hover:text-text-primary"
-          >
-            Cancel
-          </button>
-        </div>
-      ) : (
-        <div className="flex gap-2 items-center">
-          <div className="flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-muted font-mono">
-            {isSet ? maskedValue : 'Not set'}
-          </div>
-          <button
-            onClick={() => setEditing(true)}
-            className="px-3 py-2 border border-border text-xs rounded-lg text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
-          >
-            {isSet ? 'Change' : 'Set'}
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
+import { ApiKeyField } from '../shared/ApiKeyField'
+import { RemoteModelMemoryControls } from './RemoteModelMemoryControls'
 
 const PUBLIC_PROVIDERS = new Set(['openai', 'anthropic'])
 
@@ -265,6 +213,8 @@ export function ServicesSettingsPanel() {
   const llmModels = useStore(s => s.llmModels)
   const loadLlmModels = useStore(s => s.loadLlmModels)
   const [refreshing, setRefreshing] = useState(false)
+  const [worldsSaving, setWorldsSaving] = useState(false)
+  const [worldsSaveError, setWorldsSaveError] = useState<string | null>(null)
 
   if (servicesConfigLoading && !servicesConfig) {
     return <div className="text-xs text-text-muted py-4 text-center">Loading...</div>
@@ -277,11 +227,27 @@ export function ServicesSettingsPanel() {
   const isRemote = provider === 'remote'
   const isOpenAI = provider === 'openai'
   const isLocal = provider === 'local'
+  const mtpWriters = llmModels.filter(model => model.supports_mtp
+    && (model.id === servicesConfig.llm_model_id || model.id === servicesConfig.enhance_llm_model_id))
+  const supportsMtp = mtpWriters.length > 0
+  const mtpEnabled = servicesConfig.llm_mtp_acceleration === true
 
   const handleRefreshModels = async () => {
     setRefreshing(true)
     await loadLlmModels()
     setRefreshing(false)
+  }
+
+  const toggleWorlds = async () => {
+    setWorldsSaving(true)
+    setWorldsSaveError(null)
+    try {
+      await updateConfig({ worlds_enabled: servicesConfig.worlds_enabled !== true }, { throwOnError: true })
+    } catch (error) {
+      setWorldsSaveError(error instanceof Error ? error.message : 'Could not save the Worlds setting.')
+    } finally {
+      setWorldsSaving(false)
+    }
   }
 
   // Filter models by current provider (show local + remote of current provider)
@@ -369,8 +335,9 @@ export function ServicesSettingsPanel() {
                   label="Server API Key"
                   maskedValue={servicesConfig.llm_remote_api_key}
                   isSet={servicesConfig.llm_remote_api_key_set}
-                  onSave={value => {
-                    void updateConfig({ llm_remote_api_key: value }).then(() => loadLlmModels())
+                  onSave={async value => {
+                    await updateConfig({ llm_remote_api_key: value }, { throwOnError: true })
+                    void loadLlmModels()
                   }}
                 />
                 <p className="text-[10px] text-text-muted mt-1">
@@ -416,6 +383,11 @@ export function ServicesSettingsPanel() {
           )}
         </div>
 
+        {isRemote && <RemoteModelMemoryControls
+          key={servicesConfig.llm_remote_url}
+          modelId={servicesConfig.llm_model_id}
+        />}
+
         {/* Device selector (local only) */}
         {isLocal && (
           <div>
@@ -435,6 +407,70 @@ export function ServicesSettingsPanel() {
             </p>
           </div>
         )}
+        {isLocal && (
+          <div className="space-y-1" data-testid="llm-mtp-setting">
+            <label className={`flex items-start gap-3 ${supportsMtp ? 'cursor-pointer' : 'cursor-not-allowed'}`}>
+              <input
+                type="checkbox"
+                checked={mtpEnabled && supportsMtp}
+                disabled={!supportsMtp}
+                onChange={event => updateConfig({ llm_mtp_acceleration: event.target.checked })}
+                className="mt-1 h-4 w-4 accent-accent-blue shrink-0 disabled:opacity-40"
+              />
+              <span className="min-w-0 text-sm text-text-primary">
+                MTP acceleration <span className="text-amber-400">— Experimental</span>
+                <span className="block mt-1 text-[10px] leading-relaxed text-text-muted">
+                  {supportsMtp
+                    ? 'May speed up supported local writers. Uses more memory and may affect stability. Applies on the next model load; current work continues.'
+                    : 'Requires a local writer with MTP weights, such as Underdog Saluki. The selected writers use ordinary decoding.'}
+                </span>
+              </span>
+            </label>
+            {llmStatus?.loaded && llmStatus.provider === 'local' && (
+              <p className="pl-7 text-[10px] text-text-muted" data-testid="llm-mtp-active-state">
+                Loaded writer: MTP {llmStatus.mtp_acceleration ? 'on' : 'off'}.
+                {supportsMtp && (llmStatus.mtp_acceleration === true) !== mtpEnabled ? ' This preference applies when a compatible writer next loads.' : ''}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-3 border-t border-border pt-4">
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Prompt Enhancement</h3>
+        <div>
+          <label htmlFor="enhance-fidelity-retries" className="text-sm text-text-primary block mb-1.5">
+            Fidelity repair attempts
+          </label>
+          <select
+            id="enhance-fidelity-retries"
+            value={servicesConfig.enhance_fidelity_retries ?? 1}
+            onChange={e => updateConfig({ enhance_fidelity_retries: Number(e.target.value) })}
+            className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
+          >
+            {[0, 1, 2, 3, 4, 5].map(count => <option key={count} value={count}>
+              {count === 0 ? '0 — No automatic repairs' : `${count}${count === 1 ? ' — Default' : ''}`}
+            </option>)}
+          </select>
+          <p className="text-[10px] text-text-muted mt-1">
+            Extra attempts after the first draft, for the H3 story schedule and each flagged window. Stops when checks pass. More attempts take longer.
+          </p>
+        </div>
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={servicesConfig.enhance_fidelity_auto_continue ?? false}
+            onChange={e => updateConfig({ enhance_fidelity_auto_continue: e.target.checked })}
+            className="mt-1 h-4 w-4 accent-accent-blue shrink-0"
+          />
+          <span>
+            <span className="block text-sm text-text-primary">Generate even if fidelity checks fail</span>
+            <span className="block text-[10px] text-text-muted mt-1">
+              Enhance on generation continues with the saved draft after its repair attempts, instead of pausing for review. Warnings stay available. Loading and generation errors still stop the job.
+            </span>
+          </span>
+        </label>
+        <p className="text-[10px] text-text-muted">Saved for future enhancements and newly queued jobs. Enhance now still lets you inspect the draft before generating.</p>
       </div>
 
       {/* Studio Prompt Enhancer — experimental gate. Default UI uses
@@ -593,7 +629,7 @@ export function ServicesSettingsPanel() {
       <div className="space-y-3">
         <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">FlashVSR Upscaling</h3>
         <p className="text-[10px] text-text-muted -mt-1">
-          DiT super-resolution. Pick it per generation in Post Processing → Spatial Upsampling. First use downloads ~4 GB of weights.
+          Choose FlashVSR v1.1 or FlashVSR+ Turbo in Post Processing, Tools, or Editor export. Saved selections keep their model version. Weights download on first use.
         </p>
 
         <div>
@@ -630,7 +666,7 @@ export function ServicesSettingsPanel() {
             onChange={e => updateConfig({ flashvsr_topk_ratio: parseFloat(e.target.value) })}
           />
           <p className="text-[10px] text-text-muted mt-1">
-            Higher computes more attention → better motion fidelity, slower. 0 = sparsest (fastest).
+            v1.1 attention density: higher computes more attention and is slower. Plus Turbo uses its own fixed hybrid attention recipe.
           </p>
         </div>
 
@@ -674,21 +710,21 @@ export function ServicesSettingsPanel() {
               label="Google AI API Key"
               maskedValue={servicesConfig.google_api_key}
               isSet={servicesConfig.google_api_key_set}
-              onSave={val => updateConfig({ google_api_key: val })}
+              onSave={val => updateConfig({ google_api_key: val }, { throwOnError: true })}
             />
 
             <ApiKeyField
               label="OpenAI API Key"
               maskedValue={servicesConfig.openai_api_key}
               isSet={servicesConfig.openai_api_key_set}
-              onSave={val => updateConfig({ openai_api_key: val })}
+              onSave={val => updateConfig({ openai_api_key: val }, { throwOnError: true })}
             />
 
             <ApiKeyField
               label="Anthropic API Key"
               maskedValue={servicesConfig.anthropic_api_key}
               isSet={servicesConfig.anthropic_api_key_set}
-              onSave={val => updateConfig({ anthropic_api_key: val })}
+              onSave={val => updateConfig({ anthropic_api_key: val }, { throwOnError: true })}
             />
           </>
         )}
@@ -697,7 +733,7 @@ export function ServicesSettingsPanel() {
           label="CivitAI API Key"
           maskedValue={servicesConfig.civitai_api_key}
           isSet={servicesConfig.civitai_api_key_set}
-          onSave={val => updateConfig({ civitai_api_key: val })}
+          onSave={val => updateConfig({ civitai_api_key: val }, { throwOnError: true })}
         />
         <p className="text-[10px] text-text-muted -mt-2">
           Optional. Increases rate limits and enables access to restricted models.
@@ -719,6 +755,33 @@ export function ServicesSettingsPanel() {
         <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium mb-3">
           Beta Features
         </h3>
+        <div className="mb-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1">
+              <div id="worlds-mode-label" className="text-sm text-text-primary">Worlds mode (Experimental)</div>
+              <p id="worlds-mode-description" className="text-[10px] text-text-muted mt-0.5 leading-relaxed">
+                Show Worlds under Video → Create for world generation and exploration. Off by default.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-labelledby="worlds-mode-label"
+              aria-describedby="worlds-mode-description"
+              aria-checked={servicesConfig.worlds_enabled === true}
+              disabled={worldsSaving}
+              onClick={() => void toggleWorlds()}
+              className={`w-9 h-5 rounded-full transition-colors relative shrink-0 disabled:opacity-50 ${
+                servicesConfig.worlds_enabled === true ? 'bg-accent-blue' : 'bg-bg-tertiary border border-border'
+              }`}
+            >
+              <span className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white border border-border shadow transition-transform ${
+                servicesConfig.worlds_enabled === true ? 'translate-x-4' : 'translate-x-0.5'
+              }`} />
+            </button>
+          </div>
+          {worldsSaveError && <p role="alert" className="text-xs text-red-400 mt-2">{worldsSaveError}</p>}
+        </div>
         <label className="flex items-center justify-between cursor-pointer group">
           <div className="flex-1 mr-3">
             <div className="text-sm text-text-primary">

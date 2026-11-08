@@ -2,7 +2,7 @@ const {
   isSolCapable,
   needsCuda13DriverUpdate,
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
@@ -39,6 +39,17 @@ module.exports = async (kernel) => {
         ]
       }
     },
+    // Agent Access has its own CPU-only Python 3.11 environment. Keeping it
+    // separate prevents the MCP/ASGI stack from changing CUDA model wheels.
+    {
+      method: "shell.run",
+      params: {
+        venv: "env-agent",
+        venv_python: "3.11",
+        path: "app",
+        message: ["uv pip install -r requirements-agent-access.txt"]
+      }
+    },
     {
       method: "script.start",
       params: {
@@ -64,7 +75,7 @@ module.exports = async (kernel) => {
         venv: runtime.env,
         venv_python: runtime.python,
         path: "app",
-        message: "python scripts/install_gguf_kernels.py"
+        message: ["python scripts/install_gguf_kernels.py", "python scripts/install_wgp_kernels.py"]
       }
     },
     // Fetch the seed-vc voice-conversion component (GPL-3.0). It lives in

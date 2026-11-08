@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import math
 
-NR_SCALES = (1.0, 1.5, 1.724, 2.0, 3.0)
 TEMPORAL_METHODS = {"": 1, "rife2": 2, "rife3": 3, "rife4": 4,
                     **{f"dlssg*{n}": n for n in range(2, 7)}}
+
+
+def _nr_modes():
+    from postprocessing.dlss5 import runtime
+    return runtime.NR_MODES
 
 
 def dlss_scale(method):
@@ -19,7 +23,7 @@ def dlss_scale(method):
         scale = float(str(method).split("*", 1)[1])
     except ValueError as error:
         raise ValueError("Invalid DLSS Neural Rendering scale") from error
-    if scale not in NR_SCALES:
+    if scale not in _nr_modes():
         raise ValueError("DLSS Neural Rendering supports x1, x1.5, x1.724, x2 and x3")
     return scale
 
@@ -38,13 +42,17 @@ def normalize_options(options=None):
     return {"dlss_intensity": intensity, "dlss_depth": depth, "dlss_motion": motion}
 
 
-def capabilities(refresh=False):
+def capabilities(refresh=False, *, probe_neural=True):
     from postprocessing.dlss5 import runtime
     if refresh:
         runtime.dlssg_capabilities.cache_clear()
         runtime._gpu_series.cache_clear()
+        runtime._gpu_identity.cache_clear()
         runtime._hags_enabled.cache_clear()
-    nr_reason = runtime.unavailable_reason(temporal=False)
+        runtime.clear_neural_rendering_probe_cache()
+    nr_probe = runtime.neural_rendering_capabilities(allow_probe=probe_neural)
+    nr_reason = nr_probe["reason"]
+    experimental = runtime.uses_experimental_backend()
     fg_reason = runtime.unavailable_reason(temporal=True)
     probe = runtime.dlssg_capabilities() if not fg_reason else {}
     maximum = min(6 if runtime.is_rtx_50_series() else 4,
@@ -54,7 +62,10 @@ def capabilities(refresh=False):
     return {
         "rife": {"available": True, "factors": [2, 3, 4], "version": "4.26"},
         "neural_rendering": {"available": not nr_reason, "reason": nr_reason,
-                             "scales": list(NR_SCALES)},
+                             "scales": list(runtime.NR_MODES),
+                             "experimental": experimental,
+                             "validation_deferred": bool(nr_probe.get("deferred")),
+                             "backend": "direct-nr-with-separate-sr" if experimental else "wangp"},
         "frame_generation": {"available": not fg_reason, "reason": fg_reason,
                              "factors": factors},
         "guide": "docs/DLSS5.md",
@@ -66,6 +77,7 @@ def validate_methods(spatial="", temporal="", *, image=False, options=None, chec
     if spatial and scale is None and spatial not in (
         "lanczos1.5", "lanczos2", "lanczos3", "lanczos4", "vae1", "vae2",
         "flashvsr2", "flashvsr3", "flashvsr4", "flashvsr2pass2", "flashvsr2pass4",
+        "flashvsrplus2", "flashvsrplus3", "flashvsrplus4", "flashvsrplus2pass2", "flashvsrplus2pass4",
     ):
         raise ValueError(f"Unknown spatial processor: {spatial}")
     if temporal not in TEMPORAL_METHODS:
@@ -74,9 +86,13 @@ def validate_methods(spatial="", temporal="", *, image=False, options=None, chec
         raise ValueError("Temporal upsampling requires a video")
     normalized = normalize_options(options)
     if check_runtime and (scale is not None or temporal.startswith("dlssg")):
-        caps = capabilities()
+        # A capability read during user work must only consult cached state;
+        # it must never launch a native worker beside generation or Media Flow.
+        caps = capabilities(probe_neural=False)
         if scale is not None and not caps["neural_rendering"]["available"]:
             raise ValueError("DLSS Neural Rendering: " + caps["neural_rendering"]["reason"] + ". See docs/DLSS5.md.")
+        if scale is not None and scale not in caps["neural_rendering"].get("scales", _nr_modes()):
+            raise ValueError("This DLSS backend supports scales " + ", ".join(str(n) for n in caps["neural_rendering"]["scales"]))
         if temporal.startswith("dlssg"):
             fg = caps["frame_generation"]
             if not fg["available"]:
@@ -86,11 +102,13 @@ def validate_methods(spatial="", temporal="", *, image=False, options=None, chec
     return normalized
 
 
-def prepare_dlss(options, *, neural=False):
+def prepare_dlss(options, *, neural=False, scale=None):
     """Reuse the same guide weights as Maestro's depth and motion controls."""
+    from postprocessing.dlss5 import runtime
+    if neural and scale == 1 and runtime.uses_experimental_backend():
+        return  # The direct backend uses driver NVOFA, without depth/RAFT models.
     import wgp
     from shared.utils import files_locator as fl
-    from postprocessing.dlss5 import runtime
     runtime.configure_depth_estimator(wgp.server_config)
     files = []
     if neural:
@@ -110,7 +128,7 @@ def neural_render(sample, method, *, options=None, still_image=False,
                   abort_callback=None, progress_callback=None):
     from postprocessing.dlss5 import runtime
     normalized = validate_methods(method, image=still_image, options=options)
-    prepare_dlss(normalized, neural=True)
+    prepare_dlss(normalized, neural=True, scale=dlss_scale(method))
     return runtime.neural_render(sample, dlss_scale(method), still_image=still_image,
         depth_resolution=normalized["dlss_depth"], motion_vector=normalized["dlss_motion"],
         intensity=normalized["dlss_intensity"], abort_callback=abort_callback,

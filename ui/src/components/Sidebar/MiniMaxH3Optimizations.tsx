@@ -4,6 +4,7 @@ import { useStore } from '../../stores/useStore'
 import type { ModelOptions } from '../../types'
 import { InfoTooltip } from './InfoTooltip'
 import { readPersistentDisclosure, writePersistentDisclosure } from '../../lib/persistentDisclosure'
+import { isPikaFlexModelType } from '../../lib/h3Memory'
 
 const H3_OPTIMIZATIONS_EXPANDED_KEY = 'maestro-h3-optimizations-expanded'
 
@@ -13,11 +14,13 @@ export function MiniMaxH3Optimizations() {
     readPersistentDisclosure(H3_OPTIMIZATIONS_EXPANDED_KEY, true)
   ))
   const modelOptions = useStore(s => s.modelOptions)
-  const option = useStore(s => s.modelOptions?.minimax_h3_turbo)
-  const advisory = useStore(s => s.modelOptions?.minimax_h3_runtime_advisory)
   const params = useStore(s => s.params)
+  const pikaFlex = isPikaFlexModelType(params.model_type, modelOptions)
+  const option = pikaFlex ? undefined : modelOptions?.minimax_h3_turbo
+  const advisory = useStore(s => s.modelOptions?.minimax_h3_runtime_advisory)
   const currentSteps = useStore(s => s.params.num_inference_steps)
-  const defaultSteps = useStore(s => s.modelOptions?.default_num_inference_steps)
+  const defaultSteps = useStore(s => s.modelOptions?.minimax_h3_turbo?.unaccelerated_steps
+    ?? s.modelOptions?.default_num_inference_steps)
   const activatedLoras = useStore(s => s.params.activated_loras)
   const setParam = useStore(s => s.setParam)
   const toggleLora = useStore(s => s.toggleLora)
@@ -44,7 +47,7 @@ export function MiniMaxH3Optimizations() {
           revision: '',
         }]
       : []
-  const turboEnabled = params.minimax_h3_turbo_mode === true
+  const turboEnabled = !pikaFlex && params.minimax_h3_turbo_mode === true
   const defaultTurboPreset = (
     turboPresets.find(preset => preset.id === option?.preset_id)
     || turboPresets[0]
@@ -64,10 +67,16 @@ export function MiniMaxH3Optimizations() {
   const fusedTurbo = modelOptions?.minimax_h3_fused_turbo === true
   const solEnabled = params.override_attention === 'sol'
   const slaEnabled = params.override_attention === 'sla'
-  const cacheEnabled = params.skip_steps_cache_type === 'first_block'
+  const vedaEnabled = params.override_attention === 'veda'
+  const cacheEnabled = !pikaFlex && params.skip_steps_cache_type === 'first_block'
   const solSupported = modelOptions?.sol_attention_status?.supported === true
   const slaSupported = modelOptions?.sla_attention_status?.supported === true
-  const activeCount = [turboEnabled, solEnabled, slaEnabled, cacheEnabled].filter(Boolean).length
+  const slaFallbackActive = pikaFlex && slaEnabled && !slaSupported
+  const slaExperimental = modelOptions?.sla_attention_experimental === true
+  const vedaStatus = modelOptions?.veda_attention_status
+  const vedaSupported = vedaStatus?.supported === true
+  const vedaExperimental = modelOptions?.veda_attention_experimental === true
+  const activeCount = [turboEnabled, solEnabled && solSupported, slaEnabled && slaSupported, vedaEnabled && vedaSupported, cacheEnabled].filter(Boolean).length
 
   if (!isH3 && !advisory) return null
 
@@ -231,7 +240,7 @@ export function MiniMaxH3Optimizations() {
                       Fused Turbo Recipe
                     </span>
                     <span className="mt-0.5 block text-[9px] leading-relaxed text-text-muted">
-                      Turbo and Mystic are baked in. Four steps is the default; Total Steps can be adjusted from 4-12 in Advanced. Compatible H3 LoRAs are experimental. Extra Turbo/PDD and VDN adapters, Sol Engine, and First Block Cache remain disabled.
+                      Turbo and Mystic are baked in. Four steps is the default; Total Steps can be adjusted from 4-12 in Advanced. SLA is the default attention; Veda is experimental. Compatible H3 LoRAs are experimental. Extra Turbo/PDD and VDN adapters, Sol Engine, and First Block Cache remain disabled.
                     </span>
                   </span>
                 </div>
@@ -298,6 +307,26 @@ export function MiniMaxH3Optimizations() {
               </div>
             )}
 
+            {pikaFlex && (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <label htmlFor="pika-dense-attention" className="block text-[11px] font-medium text-text-primary">Dense attention</label>
+                  <p className="text-[9px] text-text-muted">{slaFallbackActive ? 'SLA is selected; dense fallback is active on this GPU.' : 'Choosing a dense backend turns sparse attention off.'}</p>
+                </div>
+                <select
+                  id="pika-dense-attention"
+                  value={slaFallbackActive ? 'fallback' : solEnabled || slaEnabled ? 'sparse' : params.override_attention === 'sdpa' ? 'sdpa' : 'sage2'}
+                  onChange={event => setParam('override_attention', event.target.value as 'sage2' | 'sdpa')}
+                  className="rounded-md border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary outline-none focus:border-accent-blue"
+                >
+                  {slaFallbackActive && <option value="fallback" disabled>Dense fallback active</option>}
+                  {(solEnabled || slaEnabled) && !slaFallbackActive && <option value="sparse" disabled>Sparse attention active</option>}
+                  <option value="sage2">Sage2</option>
+                  <option value="sdpa">SDPA</option>
+                </select>
+              </div>
+            )}
+
             {modelOptions?.sol_attention && (
               <div className={`flex items-center gap-2 px-3 py-2 transition-colors ${
                 solEnabled ? 'bg-accent-blue/10' : ''
@@ -317,7 +346,7 @@ export function MiniMaxH3Optimizations() {
                   />
                   <Gauge size={13} className={solEnabled ? 'text-accent-blue' : 'text-text-muted'} />
                   <span className="min-w-0">
-                    <span className="block text-[11px] font-medium text-text-primary">Sol Engine</span>
+                    <span className="block text-[11px] font-medium text-text-primary">Sol Engine{pikaFlex ? ' — Experimental' : ''}</span>
                     <span className="block text-[9px] text-text-muted">
                       {solSupported ? 'H3 sparse attention' : 'Unavailable in this runtime'}
                     </span>
@@ -337,28 +366,72 @@ export function MiniMaxH3Optimizations() {
                     checked={slaEnabled}
                     onChange={event => setParam(
                       'override_attention',
-                      event.target.checked ? 'sla' : 'sdpa',
+                      event.target.checked ? 'sla' : modelOptions.sla_attention_default ? 'sdpa' : '',
                     )}
                     className="accent-accent-blue"
                   />
                   <Gauge size={13} className={slaEnabled ? 'text-accent-blue' : 'text-text-muted'} />
                   <span className="min-w-0">
-                    <span className="block text-[11px] font-medium text-text-primary">SLA Sparse Attention</span>
+                    <span className="block text-[11px] font-medium text-text-primary">
+                      SLA Sparse Attention{slaExperimental ? ' — Experimental' : ''}
+                    </span>
                     <span className="block text-[9px] text-text-muted">
-                      {slaSupported ? 'Published FastH3 sparse recipe' : 'Safe dense fallback when unavailable'}
+                      {slaSupported
+                        ? slaExperimental ? pikaFlex ? 'Default on supported GPUs; compare motion and audio' : 'Optional acceleration; compare motion and audio' : 'Published FastH3 sparse recipe'
+                        : 'Safe dense fallback when unavailable'}
                     </span>
                   </span>
                 </label>
                 <InfoTooltip
                   label="About H3 SLA"
                   text={slaSupported
-                    ? 'Uses the checkpoint author\'s 90% block-sparse SLA recipe. The first use compiles and caches Triton kernels; reference and audio prefix rows stay protected.'
-                    : `${modelOptions?.sla_attention_status?.reason || 'SLA is unavailable in this runtime.'} Maestro will automatically use dense attention, so the four-step model remains usable.`}
+                    ? slaExperimental
+                      ? pikaFlex ? 'Default on supported GPUs. Uses 90% block-sparse attention and safely falls back to dense attention when unavailable. Compare motion and audio; the first use compiles Triton kernels.' : 'Uses 90% block-sparse attention on this Full or Pruned checkpoint. Off by default; speed, motion, reference fidelity and audio quality need comparison. The first use compiles Triton kernels. Reference and audio prefix rows stay protected.'
+                      : 'Uses the checkpoint author\'s 90% block-sparse SLA recipe. The first use compiles and caches Triton kernels; reference and audio prefix rows stay protected.'
+                    : `${modelOptions?.sla_attention_status?.reason || 'SLA is unavailable in this runtime.'} Maestro will automatically use dense attention.`}
                 />
               </div>
             )}
 
-            {modelOptions?.first_block_cache && (
+            {modelOptions?.veda_attention === true && (
+              <div className={`flex items-center gap-2 px-3 py-2 transition-colors ${
+                vedaEnabled ? 'bg-accent-blue/10' : ''
+              } ${vedaSupported ? '' : 'opacity-65'}`}>
+                <label className={`flex min-w-0 flex-1 items-center gap-2.5 select-none ${
+                  vedaSupported ? 'cursor-pointer' : 'cursor-not-allowed'
+                }`}>
+                  <input
+                    type="checkbox"
+                    checked={vedaEnabled}
+                    disabled={!vedaSupported}
+                    onChange={event => setParam(
+                      'override_attention',
+                      event.target.checked ? 'veda' : '',
+                    )}
+                    className="accent-accent-blue"
+                  />
+                  <Gauge size={13} className={vedaEnabled ? 'text-accent-blue' : 'text-text-muted'} />
+                  <span className="min-w-0">
+                    <span className="block text-[11px] font-medium text-text-primary">
+                      Veda Sparse Attention{vedaExperimental ? ' — Experimental' : ''}
+                    </span>
+                    <span className="block text-[9px] text-text-muted">
+                      {vedaSupported
+                        ? 'First use downloads a predictor; compare quality'
+                        : vedaStatus?.reason || 'Unavailable in this runtime'}
+                    </span>
+                  </span>
+                </label>
+                <InfoTooltip
+                  label="About H3 Veda Sparse Attention"
+                  text={vedaSupported
+                    ? 'Uses the existing H3 model with a Veda predictor downloaded on first use (about 281 MB for INT8 ConvRot or 551 MB for BF16). Compare motion, reference fidelity, and audio quality.'
+                    : `${vedaStatus?.reason || 'Veda is unavailable in this runtime.'} The toggle is disabled on unsupported hardware.`}
+                />
+              </div>
+            )}
+
+            {!pikaFlex && modelOptions?.model_type === params.model_type && modelOptions.first_block_cache && (
               <div className={`flex items-center gap-2 px-3 py-2 transition-colors ${
                 cacheEnabled ? 'bg-accent-blue/10' : ''
               }`}>

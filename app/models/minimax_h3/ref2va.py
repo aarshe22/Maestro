@@ -19,11 +19,15 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 from .speakers import (
+    H3SpeakerBindingError,
     is_h3_spoken_quote,
-    _ambiguous_ref2va_dialogue_error,
+    is_h3_production_label,
+    _REF2VA_CLIP_HEADING_RE,
+    _REF2VA_SUBJECT_DEFINITIONS_RE,
     _ref2va_alias_values,
     _resolve_ref2va_dialogue_owner_name,
-    _resolve_ref2va_dialogue_speaker,
+    _resolve_ref2va_dialogue_owners,
+    resolve_ref2va_dialogue_owners,
 )
 
 from .packing import (
@@ -33,6 +37,7 @@ from .packing import (
     MINIMAX_H3_FPS,
     MINIMAX_H3_FRAMES_PER_CHUNK,
     MINIMAX_H3_LATENTS_PER_CHUNK,
+    MINIMAX_H3_SHORT_EDGE,
     MINIMAX_H3_TEXT_TAG,
     MINIMAX_H3_VIDEO_TAG,
     MiniMaxH3PackedSequence,
@@ -46,15 +51,23 @@ from .packing import (
     resolve_canvas_size,
 )
 from .reference_manifest import (
-    MINIMAX_H3_MAX_REFERENCE_AUDIOS,
-    MINIMAX_H3_MAX_REFERENCE_IMAGES,
-    MINIMAX_H3_MAX_REFERENCE_VIDEOS,
-    MINIMAX_H3_MAX_REFERENCES,
+    MINIMAX_H3_MAX_REFERENCE_AUDIOS as MINIMAX_H3_MAX_REFERENCE_AUDIOS,
+    MINIMAX_H3_MAX_REFERENCE_IMAGES as MINIMAX_H3_MAX_REFERENCE_IMAGES,
+    MINIMAX_H3_MAX_REFERENCE_VIDEOS as MINIMAX_H3_MAX_REFERENCE_VIDEOS,
+    MINIMAX_H3_MAX_REFERENCES as MINIMAX_H3_MAX_REFERENCES,
+    object_reference_prompt_contract,
     validate_reference_manifest,
+)
+from services.h3_reference_audio import video_audio_contributes_reference_ordinal
+from .reference_media import (
+    allocate_reference_durations,
+    extract_reference_audio_window,
+    extract_reference_video_window,
 )
 
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
+MINIMAX_H3_PTD_REFERENCE_SHORT_EDGE = MINIMAX_H3_SHORT_EDGE
 MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
 _REFERENCE_TAG_RE = re.compile(r"<(?:Picture|Video|Audio)\s+\d+>", re.IGNORECASE)
@@ -82,6 +95,37 @@ _REF2VA_IDENTITY_ISOLATION_CONTRACT = (
 _REFERENCE_BACKGROUND_SESSION = None
 _REFERENCE_BACKGROUND_SESSION_LOCK = threading.Lock()
 _REFERENCE_BACKGROUND_RUN_LOCK = threading.Lock()
+
+
+def normalize_reference_detail(
+    detail: Any,
+    *,
+    ptd_refasymopd: bool = False,
+) -> str:
+    """Validate Ref2VA detail while keeping the PTD canvas model-gated.
+
+    WanGP supplies ``match`` as its legacy default for every model. PTD has a
+    fixed 768px recipe, so accept that legacy default and normalize it to the
+    pinned PTD value. Other explicit PTD values are rejected instead of
+    silently changing the adapter recipe.
+    """
+    from .ptd import PTD_REFERENCE_DETAIL
+
+    default = PTD_REFERENCE_DETAIL if ptd_refasymopd else "match"
+    value = str(detail or default).strip().lower()
+    if ptd_refasymopd:
+        if value in {"match", PTD_REFERENCE_DETAIL}:
+            return PTD_REFERENCE_DETAIL
+        raise ValueError(
+            f"PTD RefAsymOPD uses its fixed '{PTD_REFERENCE_DETAIL}' reference recipe."
+        )
+    if value == PTD_REFERENCE_DETAIL:
+        raise ValueError(
+            "Reference detail 'ptd768' is only available for PTD RefAsymOPD models."
+        )
+    if value not in {"match", "max"}:
+        raise ValueError("Reference detail must be 'match' or 'max'.")
+    return value
 
 _REF2VA_CONTEXT_IR_HEADERS = (
     "subject_definitions",
@@ -334,8 +378,7 @@ def _ref2va_voice_audio_by_subject(
         kind = item.get("type")
         carries_audio = kind == "audio" or (
             kind == "video"
-            and (item.get("has_audio") or item.get("audio_path"))
-            and item.get("include_audio", True)
+            and video_audio_contributes_reference_ordinal(item)
         )
         if not carries_audio:
             continue
@@ -361,8 +404,7 @@ def _ref2va_audio_ordinals_by_item(items: list[dict]) -> dict[int, int]:
         kind = item.get("type")
         carries_audio = kind == "audio" or (
             kind == "video"
-            and (item.get("has_audio") or item.get("audio_path"))
-            and item.get("include_audio", True)
+            and video_audio_contributes_reference_ordinal(item)
         )
         if carries_audio:
             ordinal += 1
@@ -408,8 +450,7 @@ def canonicalize_ref2va_reference_order(
     for original_index, item in ordered_entries:
         carries_audio = item.get("type") == "audio" or (
             item.get("type") == "video"
-            and (item.get("has_audio") or item.get("audio_path"))
-            and item.get("include_audio", True)
+            and video_audio_contributes_reference_ordinal(item)
         )
         if carries_audio:
             ordinal += 1
@@ -448,15 +489,19 @@ def _ref2va_dialogue_subject_order(
     )
     events.sort(key=lambda match: match.start())
 
-    order: list[int] = []
-    for match in events:
-        subject = _resolve_ref2va_dialogue_speaker(
-            source,
+    spans = [
+        (
             match.start(),
             match.end(),
-            speaker_aliases,
-            valid_subjects,
+            next((group for group in match.groups() if group is not None), match.group(0)),
         )
+        for match in events
+    ]
+    resolved = _resolve_ref2va_dialogue_owners(
+        source, spans, speaker_aliases, valid_subjects, strict=False,
+    )
+    order: list[int] = []
+    for subject, _owner in resolved:
         if subject in valid_subjects and subject not in order:
             order.append(subject)
     return order
@@ -523,7 +568,7 @@ def select_ref2va_window_voice_references(
     current prompt and their Audio ordinals are rebuilt atomically.
     """
 
-    source_prompt, items, _order_remap = canonicalize_ref2va_reference_order(
+    source_prompt, items, _order_remap = align_ref2va_voice_reference_order(
         prompt,
         references,
     )
@@ -552,10 +597,7 @@ def select_ref2va_window_voice_references(
     for item_index, item in enumerate(items):
         kind = item.get("type")
         if kind == "video":
-            if (
-                (item.get("has_audio") or item.get("audio_path"))
-                and item.get("include_audio", True)
-            ):
+            if video_audio_contributes_reference_ordinal(item):
                 audio_ordinal += 1
                 non_voice_audio_count += 1
                 audio_entries.append((item_index, audio_ordinal, False, None))
@@ -663,23 +705,378 @@ def _remap_ref2va_reference_labels(
     return _remap_ref2va_audio_labels(source, ordinal_maps.get("Audio", {}))
 
 
+def _ref2va_reference_subject_layout(items: list[dict]):
+    """Return runtime Subject IDs, media ordinals, and identity aliases.
+
+    Character visuals are allocated by the runtime allocator first. Scene and
+    style images follow those subjects; composition and object images never
+    receive a Subject. Keeping this layout next to the runtime compiler lets
+    legacy prompts be reconciled using the same numbering contract.
+    """
+
+    (
+        character_reference_subjects,
+        character_subjects,
+        role_subjects,
+        speaker_aliases,
+        character_subject_count,
+    ) = _build_ref2va_character_bindings(items)
+
+    reference_subjects: dict[int, int | None] = {
+        index: character_reference_subjects.get(index)
+        for index in range(len(items))
+    }
+    subject_index = character_subject_count
+    picture_targets: dict[int, int | None] = {}
+    video_targets: dict[int, int | None] = {}
+    picture = video = 0
+    for index, item in enumerate(items):
+        kind = item.get("type")
+        target = reference_subjects.get(index)
+        if kind == "image":
+            picture += 1
+            intent = item.get("image_intent", "identity")
+            if intent in {"scene", "style"}:
+                subject_index += 1
+                target = subject_index
+                reference_subjects[index] = target
+            picture_targets[picture] = target
+        elif kind == "video":
+            video += 1
+            video_targets[video] = target
+
+    aliases: dict[str, set[int | None]] = {}
+    for index, item in enumerate(items):
+        target = reference_subjects.get(index)
+        if item.get("type") == "audio" and item.get("audio_intent", "voice") == "voice":
+            target = _ref2va_audio_item_subject(
+                item, character_subjects, role_subjects,
+            )
+        for alias in _ref2va_alias_values(item):
+            if not is_h3_production_label(alias):
+                aliases.setdefault(alias, set()).add(target)
+
+    return (
+        reference_subjects,
+        picture_targets,
+        video_targets,
+        aliases,
+        speaker_aliases,
+        character_subject_count,
+        character_subjects,
+        role_subjects,
+    )
+
+
+def _ref2va_identity_alias_targets(source: str, aliases: dict[str, set[int | None]]):
+    """Find exact known reference names mentioned in one declaration clause."""
+
+    targets: set[int | None] = set()
+    for alias, candidates in aliases.items():
+        if not alias or is_h3_production_label(alias):
+            continue
+        alias_pattern = r"[\s_-]*".join(re.escape(char) for char in alias)
+        if re.search(rf"(?<!\w){alias_pattern}(?!\w)", source, re.IGNORECASE):
+            targets.update(candidates)
+    return targets
+
+
+def _ref2va_subject_definition_end(source: str, start: int, limit: int) -> int:
+    """Find a declaration boundary without splitting common name titles."""
+
+    for match in re.finditer(r"[.;\r\n]", source[start:limit]):
+        if match.group(0) == ".":
+            prefix = source[start:start + match.end()]
+            if re.search(r"(?i)\b(?:dr|mr|mrs|ms|prof|sr|jr|st)\.$", prefix):
+                continue
+        return start + match.start()
+    return limit
+
+
+def _ref2va_subject_definition_bindings(
+    prompt: str,
+    picture_targets: dict[int, int | None],
+    video_targets: dict[int, int | None],
+    aliases: dict[str, set[int | None]],
+) -> dict[int, int | None]:
+    """Resolve explicit legacy Subject definitions against selected media.
+
+    ``(Sx)`` markers are deliberately ignored. A definition is useful only
+    when its known name or Picture/Video label identifies a selected
+    reference. If both forms of evidence are present they must agree.
+    """
+
+    field = _REF2VA_SUBJECT_DEFINITIONS_RE.search(str(prompt or ""))
+    if not field:
+        return {}
+    body = field.group(1)
+    declarations = list(re.finditer(r"<Subject\s+(\d+)>", body, re.IGNORECASE))
+    bindings: dict[int, int | None] = {}
+
+    for index, declaration in enumerate(declarations):
+        subject = int(declaration.group(1))
+        limit = declarations[index + 1].start() if index + 1 < len(declarations) else len(body)
+        end = _ref2va_subject_definition_end(body, declaration.end(), limit)
+        clause = body[declaration.start():end]
+
+        media_targets: set[int | None] = set()
+        for kind, targets in (("Picture", picture_targets), ("Video", video_targets)):
+            for media_match in re.finditer(
+                rf"(?:<{kind}\s+(\d+)>|\b{kind}\s+(\d+)\b)",
+                clause,
+                re.IGNORECASE,
+            ):
+                ordinal = int(media_match.group(1) or media_match.group(2))
+                if ordinal not in targets:
+                    raise H3SpeakerBindingError(
+                        "MiniMax H3 reference binding conflict: "
+                        f"<Subject {subject}> names missing <{kind} {ordinal}> media."
+                    )
+                media_targets.add(targets[ordinal])
+
+        name_targets = _ref2va_identity_alias_targets(clause, aliases)
+        if len(media_targets) > 1:
+            raise H3SpeakerBindingError(
+                "MiniMax H3 reference binding conflict: "
+                f"<Subject {subject}> points to multiple selected visual references."
+            )
+        if media_targets:
+            target = next(iter(media_targets))
+            if name_targets and target not in name_targets:
+                raise H3SpeakerBindingError(
+                    "MiniMax H3 reference binding conflict: "
+                    f"<Subject {subject}> name and Picture/Video evidence identify different references."
+                )
+        elif len(name_targets) > 1:
+            raise H3SpeakerBindingError(
+                "MiniMax H3 reference binding is ambiguous: "
+                f"<Subject {subject}> names more than one selected reference."
+            )
+        elif name_targets:
+            target = next(iter(name_targets))
+        else:
+            # An S marker, an unexplained integer, or generic prose is not
+            # enough identity evidence to rewrite a Subject number.
+            continue
+
+        if subject in bindings and bindings[subject] != target:
+            raise H3SpeakerBindingError(
+                "MiniMax H3 reference binding conflict: "
+                f"subject_definitions give <Subject {subject}> different identities."
+            )
+        bindings[subject] = target
+
+    return bindings
+
+
+def _remap_ref2va_subject_bindings(
+    prompt: str,
+    bindings: dict[int, int | None],
+) -> tuple[str, dict[int, int]]:
+    """Atomically reconcile explicit legacy Subjects and return changed IDs."""
+
+    changed = {
+        old: target
+        for old, target in bindings.items()
+        if target is not None and old != target
+    }
+
+    def replace(match: re.Match) -> str:
+        old = int(match.group(1))
+        if old not in bindings:
+            return match.group(0)
+        target = bindings[old]
+        return f"<Subject {target}>" if target is not None else ""
+
+    source = re.sub(r"<Subject\s+(\d+)>", replace, str(prompt or ""), flags=re.IGNORECASE)
+    return source, changed
+
+
+def _ref2va_reconcile_voice_audio_labels(
+    prompt: str,
+    items: list[dict],
+    aliases: dict[str, set[int | None]],
+    character_subjects: dict[str, int],
+    role_subjects: dict[str, int],
+) -> tuple[str, dict[int, int]]:
+    """Pair legacy voice Audio labels with the runtime's selected voice rows."""
+
+    field = _REF2VA_SUBJECT_DEFINITIONS_RE.search(str(prompt or ""))
+    if not field:
+        return prompt, {}
+    audio_by_subject = _ref2va_voice_audio_by_subject(
+        items, character_subjects, role_subjects,
+    )
+    audio_map: dict[int, int] = {}
+    clauses = re.split(r"(?<=[.;])\s+|\r?\n+", field.group(1))
+    for clause in clauses:
+        if not re.search(r"\bvoice(?:-timbre)?\s+reference\b", clause, re.IGNORECASE):
+            continue
+        audio_labels = [
+            int(match.group("tag_index") or match.group("plain_index"))
+            for match in _AUDIO_LABEL_RE.finditer(clause)
+        ]
+        if not audio_labels:
+            continue
+        subject_labels = {
+            int(value) for value in re.findall(r"<Subject\s+(\d+)>", clause, re.IGNORECASE)
+        }
+        subject_targets: set[int | None] = set(subject_labels)
+        if not subject_targets:
+            subject_targets = _ref2va_identity_alias_targets(clause, aliases)
+        if len(audio_labels) != 1 or len(subject_targets) != 1:
+            raise H3SpeakerBindingError(
+                "MiniMax H3 reference binding is ambiguous: "
+                "a legacy voice reference does not identify one Audio and one character."
+            )
+        subject = next(iter(subject_targets))
+        if subject is None or subject not in audio_by_subject:
+            # Generic voice references without a runtime character pairing
+            # retain their manifest ordinal and existing guest compatibility.
+            continue
+        old_audio = audio_labels[0]
+        target_audio = audio_by_subject[subject]
+        if old_audio in audio_map and audio_map[old_audio] != target_audio:
+            raise H3SpeakerBindingError(
+                "MiniMax H3 reference binding conflict: one legacy Audio label "
+                "is assigned to multiple character voices."
+            )
+        audio_map[old_audio] = target_audio
+
+    changed = {old: new for old, new in audio_map.items() if old != new}
+    return _remap_ref2va_audio_labels(prompt, changed), changed
+
+
+def _validate_ref2va_named_subject_cues(
+    prompt: str,
+    speaker_aliases: dict[str, int],
+    character_subject_count: int,
+) -> None:
+    """Reject a dialogue name that conflicts with its explicit Subject cue."""
+
+    valid_subjects = set(range(1, character_subject_count + 1))
+    previous_end = 0
+    definitions = _REF2VA_SUBJECT_DEFINITIONS_RE.search(str(prompt or ""))
+    definitions_span = (
+        (definitions.start(1), definitions.end(1)) if definitions else None
+    )
+    for dialogue in _DIALOGUE_TAG_RE.finditer(str(prompt or "")):
+        before_start = max(previous_end, dialogue.start() - 420)
+        before = prompt[before_start:dialogue.start()]
+        headings = list(_REF2VA_CLIP_HEADING_RE.finditer(before))
+        if headings:
+            heading_end = headings[-1].end()
+            before_start += heading_end
+            before = before[heading_end:]
+        clause_start = max(
+            before.rfind("."), before.rfind("!"), before.rfind("?"),
+            before.rfind(";"), before.rfind("\n"),
+        ) + 1
+        clause = before[clause_start:]
+        subject_matches = list(re.finditer(r"<Subject\s+(\d+)>", clause, re.IGNORECASE))
+        if subject_matches:
+            absolute_start = before_start + clause_start + subject_matches[-1].start()
+            if definitions_span is None or not (
+                definitions_span[0] <= absolute_start < definitions_span[1]
+            ):
+                explicit_subject = int(subject_matches[-1].group(1))
+                owner = _resolve_ref2va_dialogue_owner_name(
+                    prompt, dialogue.start(), dialogue.end(),
+                )
+                owner_subjects = {
+                    speaker_aliases[alias]
+                    for alias in _ref2va_alias_values({"character_name": owner})
+                    if alias in speaker_aliases
+                }
+                if len(owner_subjects) == 1:
+                    owner_subject = next(iter(owner_subjects))
+                    if explicit_subject != owner_subject:
+                        raise H3SpeakerBindingError(
+                            "MiniMax H3 reference binding conflict: "
+                            f"<Subject {explicit_subject}> conflicts with named speaker "
+                            f"{owner!r}, whose selected reference is <Subject {owner_subject}>. "
+                            "Use a matching subject_definitions identity or correct the cue."
+                        )
+                elif explicit_subject not in valid_subjects and owner:
+                    raise H3SpeakerBindingError(
+                        "MiniMax H3 reference binding conflict: "
+                        f"dialogue cue uses missing character <Subject {explicit_subject}>."
+                    )
+        previous_end = dialogue.end()
+
+
 def align_ref2va_voice_reference_order(
     prompt: str,
     references,
 ) -> tuple[str, list[dict], dict[str, dict[int, int]]]:
-    """Keep immutable Subject identities while normalizing media presentation.
+    """Align explicit legacy Subject/voice bindings to selected references.
 
-    ``<Subject N>`` identifies reusable reference content; ``(Sx)`` identifies
-    first-vocal-event order inside one target clip.  Reordering complete
-    character groups to make those two namespaces numerically match was not
-    part of MiniMax's contract and made identity labels depend on dialogue
-    order.  Keep Subject/Picture labels stable and only normalize the physical
-    presentation to visual references followed by standalone audio.
+    Explicit subject definitions may have been authored against an older
+    reference list. Resolve their known names or Picture/Video labels against
+    the current runtime allocator before voice pruning. Speaker markers alone
+    never establish a Subject mapping.
     """
 
-    return canonicalize_ref2va_reference_order(prompt, references)
+    source, items, ordinal_maps = canonicalize_ref2va_reference_order(
+        prompt, references,
+    )
+    (
+        reference_subjects,
+        picture_targets,
+        video_targets,
+        aliases,
+        speaker_aliases,
+        character_subject_count,
+        character_subjects,
+        role_subjects,
+    ) = _ref2va_reference_subject_layout(items)
+    subject_bindings = _ref2va_subject_definition_bindings(
+        source, picture_targets, video_targets, aliases,
+    )
+    source, subject_map = _remap_ref2va_subject_bindings(source, subject_bindings)
+    source, audio_map = _ref2va_reconcile_voice_audio_labels(
+        source, items, aliases, character_subjects, role_subjects,
+    )
+
+    # Prove direct name/Subject agreement after any definition-backed remap.
+    _validate_ref2va_named_subject_cues(
+        source, speaker_aliases, character_subject_count,
+    )
+    if subject_map:
+        ordinal_maps = {**ordinal_maps, "Subject": subject_map}
+    if audio_map:
+        existing_audio = dict(ordinal_maps.get("Audio", {}))
+        existing_audio.update(audio_map)
+        ordinal_maps = {**ordinal_maps, "Audio": existing_audio}
+    return source, items, ordinal_maps
 
 
+
+
+def _ref2va_event_speaker_marker(
+    source: str,
+    dialogue_start: int,
+    previous_dialogue_end: int,
+    definitions_span: tuple[int, int] | None,
+) -> re.Match | None:
+    """Find this event's marker without consuming a definition or heading."""
+
+    context_start = max(previous_dialogue_end, dialogue_start - 240)
+    headings = list(_REF2VA_CLIP_HEADING_RE.finditer(
+        source, context_start, dialogue_start,
+    ))
+    if headings:
+        context_start = max(context_start, headings[-1].end())
+    markers = [
+        match for match in _SPEAKER_MARKER_RE.finditer(
+            source, context_start, dialogue_start,
+        )
+        if not (
+            definitions_span is not None
+            and definitions_span[0] <= match.start() < definitions_span[1]
+        )
+    ]
+    return markers[-1] if markers else None
 
 
 def _canonicalize_ref2va_tagged_dialogue(
@@ -701,34 +1098,26 @@ def _canonicalize_ref2va_tagged_dialogue(
     matches = list(_DIALOGUE_TAG_RE.finditer(text))
     if not matches:
         return text
+    resolved_owners = resolve_ref2va_dialogue_owners(
+        text,
+        [(match.start(), match.end(), match.group(1).strip()) for match in matches],
+        speaker_aliases,
+        valid_subjects,
+    )
     edits: list[tuple[int, int, str]] = []
     vocal_speakers: dict[tuple[str, Any], int] = {}
     previous_dialogue_end = 0
-    for match in matches:
-        words = match.group(1).strip()
-        subject = _resolve_ref2va_dialogue_speaker(
-            text,
-            match.start(),
-            match.end(),
-            speaker_aliases,
-            valid_subjects,
+    definition_field = _REF2VA_SUBJECT_DEFINITIONS_RE.search(text)
+    definitions_span = (
+        (definition_field.start(1), definition_field.end(1))
+        if definition_field else None
+    )
+    for match, (subject, explicit_owner) in zip(matches, resolved_owners):
+        marker = _ref2va_event_speaker_marker(
+            text, match.start(), previous_dialogue_end, definitions_span,
         )
-        explicit_owner = _resolve_ref2va_dialogue_owner_name(
-            text,
-            match.start(),
-            match.end(),
-        )
-        context_start = max(previous_dialogue_end, match.start() - 240)
-        markers = list(_SPEAKER_MARKER_RE.finditer(text, context_start, match.start()))
-        marker = markers[-1] if markers else None
-        # ``(Sx)`` is vocal-event order, not a Subject identifier.  It can
-        # validate a resolved speaker but must never select a face by itself.
-        # The old fallback silently mapped S1 to Subject 1, which is exactly
-        # how a correct voice could be lip-synced by the wrong character.
-        if subject is None and character_subject_count == 1 and not explicit_owner:
-            subject = 1
-        if subject is None and character_subject_count > 1 and not explicit_owner:
-            raise _ambiguous_ref2va_dialogue_error(words)
+        # The shared resolver proves ownership; event numbering is local to
+        # this clip and remains independent of Subject and Audio ordinals.
         speaker_key: tuple[str, Any] = (
             ("subject", subject)
             if subject is not None else
@@ -851,8 +1240,71 @@ def _ensure_ref2va_identity_isolation_contract(text: str, items: list[dict]) -> 
     return f"{source} {_REF2VA_IDENTITY_ISOLATION_CONTRACT}".strip()
 
 
+def _ensure_ref2va_object_contract(text: str, items: list[dict]) -> str:
+    """Keep object roles explicit when a manual prompt already has media tags."""
+
+    compiled = str(text or "")
+    picture = 0
+    for item in items:
+        if item.get("type") != "image":
+            continue
+        picture += 1
+        if item.get("image_intent", "identity") != "object":
+            continue
+        definition, retention = object_reference_prompt_contract(
+            f"<Picture {picture}>", item.get("role", ""),
+        )
+        for clause, section_name, next_field in (
+            (definition, "subject_definitions", "summary"),
+            (retention, "retention_analysis", "detailed_description"),
+        ):
+            if clause.casefold() in compiled.casefold():
+                continue
+            pattern = re.compile(
+                rf"(?ms)(^\s*{section_name}\s*:.*?)(?=^\s*{next_field}\s*:)",
+            )
+            if pattern.search(compiled):
+                compiled = pattern.sub(
+                    lambda match: f"{match.group(1).rstrip()} {clause}\n\n",
+                    compiled, count=1,
+                )
+            else:
+                compiled = f"{compiled.rstrip()} {clause}".strip()
+    return compiled
+
+
+def _ensure_ref2va_sound_effect_contract(text: str, items: list[dict]) -> str:
+    """Keep short effect samples reusable in raw and enhanced window prompts."""
+
+    compiled = str(text or "")
+    audio_ordinals = _ref2va_audio_ordinals_by_item(items)
+    for index, item in enumerate(items):
+        if item.get("type") != "audio" or item.get("audio_intent") != "sound":
+            continue
+        contract = (
+            f"Use the timbre and texture of <Audio {audio_ordinals[index]}> for the "
+            "explicitly requested matching sound effects in this window, synchronized "
+            "to the visible actions; the sample supplies reusable sound character "
+            "rather than a continuous soundtrack."
+        )
+        if contract.casefold() in compiled.casefold():
+            continue
+        music = re.search(r"(?mi)^\s*non_diegetic_music\s*:", compiled)
+        if music:
+            insert_at = music.start()
+            compiled = (
+                f"{compiled[:insert_at].rstrip()} {contract}\n\n"
+                f"{compiled[insert_at:].lstrip()}"
+            )
+        else:
+            compiled = f"{compiled.rstrip()} {contract}".strip()
+    return compiled
+
+
 def _apply_ref2va_media_contracts(text: str, items: list[dict]) -> str:
     compiled = _ensure_ref2va_identity_isolation_contract(text, items)
+    compiled = _ensure_ref2va_object_contract(compiled, items)
+    compiled = _ensure_ref2va_sound_effect_contract(compiled, items)
     if any(
         item.get("type") == "audio"
         and item.get("audio_intent", "voice") == "voice"
@@ -906,7 +1358,7 @@ def ensure_ref2va_prompt_relationships(
     the same immutable character manifest used for raw prompts.
     """
 
-    ordered_prompt, items, _order_remap = canonicalize_ref2va_reference_order(
+    ordered_prompt, items, _order_remap = align_ref2va_voice_reference_order(
         prompt,
         references,
     )
@@ -948,7 +1400,13 @@ def ensure_ref2va_prompt_relationships(
         if kind == "image":
             picture_index += 1
             intent = item.get("image_intent", "identity")
-            if intent == "composition":
+            if intent == "object":
+                definition, analysis = object_reference_prompt_contract(
+                    f"<Picture {picture_index}>", role,
+                )
+                relationships.append(definition)
+                retention.append(analysis)
+            elif intent == "composition":
                 relationships.append(
                     f"<Picture {picture_index}> is a soft composition and cast-layout reference for {role} "
                     "that preserves the intended subjects, wardrobe, setting, and spatial arrangement "
@@ -1060,6 +1518,16 @@ def ensure_ref2va_prompt_relationships(
             retention.append(
                 f"<Audio {audio_index}>: weak_reference - retain broad similarity in sound, rhythm, "
                 "texture, or music style."
+            )
+        elif intent == "sound":
+            relationships.append(
+                f"<Audio {audio_index}> is a reusable sound-effect reference for {role}; "
+                "generate matching effects for the requested actions using its timbre and "
+                "texture, with timing determined by those actions in each window."
+            )
+            retention.append(
+                f"<Audio {audio_index}>: reference - retain the sound effect's timbre and "
+                "texture without copying its waveform or original timing."
             )
         else:
             character_key = str(item.get("library_character_id") or "").strip()
@@ -1174,7 +1642,7 @@ def ensure_ref2va_prompt_relationships(
         task_types.append("audio reuse")
     if any(
         item.get("type") == "audio"
-        and item.get("audio_intent", "voice") in {"voice", "style"}
+        and item.get("audio_intent", "voice") in {"voice", "style", "sound"}
         for item in items
     ):
         task_types.append("audio reference")
@@ -1340,7 +1808,7 @@ def resolve_reference_image_size(
     target_height: int | None = None,
     target_width: int | None = None,
 ) -> tuple[int, int]:
-    """Resolve official maximum detail or Maestro's consumer-friendly match size."""
+    """Resolve Ref2VA image geometry for match, PDD max, or the fixed PTD recipe."""
 
     if width <= 0 or height <= 0:
         raise ValueError(f"A reference image must have a positive size, got {width}x{height}.")
@@ -1349,12 +1817,14 @@ def resolve_reference_image_size(
     multiple = MINIMAX_H3_CANVAS_MULTIPLE
     if detail == "max":
         scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    elif detail == "ptd768":
+        scale = MINIMAX_H3_PTD_REFERENCE_SHORT_EDGE / min(width, height)
     elif detail == "match":
         if not target_height or not target_width:
             raise ValueError("Matched reference detail needs the target height and width.")
         scale = min(1.0, math.sqrt((target_height * target_width) / float(height * width)))
     else:
-        raise ValueError("Reference detail must be 'match' or 'max'.")
+        raise ValueError("Reference detail must be 'match', 'max', or the PTD-only 'ptd768'.")
     return (
         max(multiple, round(height * scale / multiple) * multiple),
         max(multiple, round(width * scale / multiple) * multiple),
@@ -1417,7 +1887,7 @@ def _isolate_reference_image_background_cached(
     modified_ns: int,
     file_size: int,
 ) -> Image.Image:
-    """Return a cached white-background identity portrait.
+    """Return a cached white-background character or object reference.
 
     The stat values intentionally participate in the cache key so replacing a
     file at the same path cannot reuse an obsolete cutout.
@@ -1442,16 +1912,16 @@ def _isolate_reference_image_background_cached(
             bgcolor=(255, 255, 255, 0),
         )
     if not isinstance(cutout, Image.Image):
-        raise ValueError("U2Net returned an unsupported character cutout.")
+        raise ValueError("U2Net returned an unsupported reference cutout.")
     print(
-        "[MiniMax H3 Ref2VA] Isolated character background: "
+        "[MiniMax H3 Ref2VA] Isolated reference background: "
         f"{os.path.basename(normalized_path)}."
     )
     return cutout.convert("RGB")
 
 
 def isolate_reference_image_background(path: str) -> Image.Image:
-    """Remove one identity portrait's source background without changing it."""
+    """Remove a character or object's source background without changing its file."""
 
     normalized_path = os.path.normcase(os.path.realpath(path))
     stat = os.stat(normalized_path)
@@ -1481,7 +1951,7 @@ def resolve_reference_video_size(
     target_height: int | None = None,
     target_width: int | None = None,
 ) -> tuple[int, int]:
-    """Resolve Ref2VA video detail without silently exceeding the output area.
+    """Resolve Ref2VA video detail, including PTD's exact 768px short edge.
 
     The official high-detail path keeps MiniMax's 768px-short-edge canvas.
     Maestro's default ``match`` path instead preserves the reference aspect
@@ -1497,8 +1967,15 @@ def resolve_reference_video_size(
         raise ValueError(f"A reference video must be within 1:4 and 4:1, got {width}x{height}.")
     if detail == "max":
         return resolve_canvas_size(width, height)
+    if detail == "ptd768":
+        scale = MINIMAX_H3_PTD_REFERENCE_SHORT_EDGE / min(width, height)
+        multiple = MINIMAX_H3_CANVAS_MULTIPLE
+        return (
+            max(multiple, round(height * scale / multiple) * multiple),
+            max(multiple, round(width * scale / multiple) * multiple),
+        )
     if detail != "match":
-        raise ValueError("Reference detail must be 'match' or 'max'.")
+        raise ValueError("Reference detail must be 'match', 'max', or the PTD-only 'ptd768'.")
     if not target_height or not target_width:
         raise ValueError("Matched reference detail needs the target height and width.")
 
@@ -1577,6 +2054,75 @@ def prepare_reference_waveform(
     return waveform.contiguous()
 
 
+def _reference_pass_budgets(items: list[dict], kind: str, pass_duration: float) -> dict[int, float]:
+    """Fairly cap each pass's video or audio references at 15 seconds total."""
+
+    selected = [
+        (index, item)
+        for index, item in enumerate(items)
+        if item.get("type") == kind
+    ]
+    if not selected:
+        return {}
+
+    durations: list[float] = []
+    for _index, item in selected:
+        duration = None
+        for key in ("effective_duration_seconds", "source_duration_seconds"):
+            try:
+                candidate = float(item.get(key))
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if math.isfinite(candidate) and candidate > 0:
+                duration = candidate
+                break
+        if duration is None:
+            from .reference_media import _probe_duration
+
+            duration = _probe_duration(item["path"])
+        durations.append(max(2.0, duration))
+
+    allocated = allocate_reference_durations(durations)
+    pass_duration = max(0.0, float(pass_duration))
+    budgets = [min(pass_duration, budget) for budget in allocated]
+    allowed_seconds = min(15.0, pass_duration * len(selected))
+    excess = max(0.0, sum(budgets) - allowed_seconds)
+    for index in sorted(range(len(budgets)), key=budgets.__getitem__, reverse=True):
+        reduction = min(excess, budgets[index])
+        budgets[index] -= reduction
+        excess -= reduction
+        if excess <= 1e-9:
+            break
+
+    if kind == "video":
+        frame_counts = [max(1, int(round(value * MINIMAX_H3_FPS))) for value in budgets]
+        max_total_frames = min(
+            int(round(15.0 * MINIMAX_H3_FPS)),
+            int(round(pass_duration * MINIMAX_H3_FPS)) * len(selected),
+        )
+        while sum(frame_counts) > max_total_frames:
+            longest = max(range(len(frame_counts)), key=frame_counts.__getitem__)
+            if frame_counts[longest] <= 1:
+                break
+            frame_counts[longest] -= 1
+        budgets = [count / MINIMAX_H3_FPS for count in frame_counts]
+
+    return {index: budget for (index, _item), budget in zip(selected, budgets)}
+
+
+def _decode_timeline_audio_window(
+    path: str,
+    start_time: float,
+    duration: float,
+) -> tuple[torch.Tensor, int]:
+    """Decode one bounded FFmpeg-cached window from the original timeline."""
+
+    segment_path = extract_reference_audio_window(path, start_time, duration)
+    if not segment_path:
+        raise ValueError(f"No audio stream was found in {os.path.basename(path)}.")
+    return decode_reference_audio(segment_path)
+
+
 def prepare_references(
     manifest,
     *,
@@ -1603,9 +2149,11 @@ def prepare_references(
         max_duration = 15.0
     timeline_start_frame = max(0, int(timeline_start_frame or 0))
     timeline_start_time = timeline_start_frame / MINIMAX_H3_FPS
+    video_budgets = _reference_pass_budgets(items, "video", max_duration)
+    audio_budgets = _reference_pass_budgets(items, "audio", max_duration)
     prepared: list[MiniMaxH3PreparedReference] = []
 
-    for item in items:
+    for item_index, item in enumerate(items):
         kind = item["type"]
         reference = MiniMaxH3PreparedReference(
             kind=kind,
@@ -1622,7 +2170,7 @@ def prepare_references(
                     # Background isolation improves identity cleanliness but
                     # must never turn a valid reference into a failed render.
                     print(
-                        "[MiniMax H3 Ref2VA] Character background isolation "
+                        "[MiniMax H3 Ref2VA] Reference background isolation "
                         f"failed for {os.path.basename(item['path'])}; using the "
                         f"original image ({error})."
                     )
@@ -1642,41 +2190,98 @@ def prepare_references(
             wants_embedded_audio = bool(item.get("include_audio", True)) and not item.get("audio_path")
             if item.get("has_audio") is False:
                 wants_embedded_audio = False
-            frames, fps, soundtrack = decode_reference_video(item["path"], decode_audio=wants_embedded_audio)
+            video_budget = video_budgets.get(item_index, max_duration)
+            video_frame_budget = max(1, int(round(video_budget * MINIMAX_H3_FPS)))
+            follows_timeline = bool(item.get("follow_timeline", False))
+            video_start_time = timeline_start_time if follows_timeline else 0.0
+            video_path = extract_reference_video_window(
+                item["path"],
+                video_start_time,
+                video_budget,
+                include_audio=wants_embedded_audio,
+                target_fps=MINIMAX_H3_FPS,
+            )
+            frames, fps, soundtrack = decode_reference_video(video_path, decode_audio=False)
             frames = resample_reference_frames(reference_media_to_uint8(frames), fps)
             source_height, source_width = frames.shape[1:3]
             reference.frames = prepare_reference_frames(
                 frames,
-                num_frames,
+                video_frame_budget,
                 detail=detail,
                 target_height=target_height,
                 target_width=target_width,
             )
             prepared_height, prepared_width = reference.frames.shape[1:3]
+            video_window_end = video_start_time + video_frame_budget / MINIMAX_H3_FPS
+            window_mode = "timeline" if follows_timeline else "static"
             print(
                 "[MiniMax H3 Ref2VA] Prepared reference video "
                 f"{source_width}x{source_height} -> {prepared_width}x{prepared_height} "
-                f"({reference.frames.shape[0]} frames, detail={detail})."
+                f"({reference.frames.shape[0]} frames, {window_mode} window "
+                f"{video_start_time:.2f}-{video_window_end:.2f}s, detail={detail})."
             )
             if item.get("include_audio", True):
+                audio_window_duration = video_frame_budget / MINIMAX_H3_FPS
+                audio_start_time = timeline_start_time if follows_timeline else 0.0
+                pad_audio = follows_timeline
                 if item.get("audio_path"):
-                    soundtrack = decode_reference_audio(item["audio_path"])
+                    audio_path = extract_reference_audio_window(
+                        item["audio_path"],
+                        audio_start_time,
+                        audio_window_duration,
+                        pad_to_duration=pad_audio,
+                    )
+                    if not audio_path:
+                        raise ValueError(
+                            f"No audio stream was found in {os.path.basename(item['audio_path'])}."
+                        )
+                    soundtrack = decode_reference_audio(audio_path)
+                elif wants_embedded_audio:
+                    audio_path = extract_reference_audio_window(
+                        item["path"],
+                        audio_start_time,
+                        audio_window_duration,
+                        pad_to_duration=pad_audio,
+                    )
+                    soundtrack = decode_reference_audio(audio_path) if audio_path else None
                 if soundtrack is not None:
                     waveform, sample_rate = soundtrack
                     reference.waveform = prepare_reference_waveform(
-                        waveform, sample_rate, audio_sample_rate, max_duration
+                        waveform,
+                        sample_rate,
+                        audio_sample_rate,
+                        audio_window_duration,
+                        pad_to_duration=pad_audio,
                     )
                     reference.has_audio = reference.waveform.shape[-1] > 0
         else:
-            waveform, sample_rate = decode_reference_audio(item["path"])
             intent = item.get("audio_intent", "voice")
+            # Voices and short sound-effect samples are reusable references.
+            # Music/performance tracks instead advance with the sequence clock.
             follows_sequence_timeline = intent in {"drive", "style"}
-            segment_start_time = timeline_start_time if follows_sequence_timeline else 0.0
+            audio_budget = audio_budgets.get(item_index, max_duration)
+            audio_window_duration = audio_budget
+            if follows_sequence_timeline:
+                waveform, sample_rate = _decode_timeline_audio_window(
+                    item["path"], timeline_start_time, audio_window_duration
+                )
+                segment_start_time = 0.0
+            else:
+                audio_path = extract_reference_audio_window(
+                    item["path"],
+                    0.0,
+                    audio_window_duration,
+                    pad_to_duration=False,
+                )
+                if not audio_path:
+                    raise ValueError(f"No audio stream was found in {os.path.basename(item['path'])}.")
+                waveform, sample_rate = decode_reference_audio(audio_path)
+                segment_start_time = 0.0
             reference.waveform = prepare_reference_waveform(
                 waveform,
                 sample_rate,
                 audio_sample_rate,
-                max_duration,
+                audio_window_duration,
                 start_time=segment_start_time,
                 pad_to_duration=follows_sequence_timeline,
             )
@@ -1685,7 +2290,14 @@ def prepare_references(
                 print(
                     "[MiniMax H3 Ref2VA] Prepared "
                     f"{intent} audio timeline segment "
-                    f"{segment_start_time:.2f}-{segment_start_time + max_duration:.2f}s "
+                    f"{timeline_start_time:.2f}-{timeline_start_time + audio_window_duration:.2f}s "
+                    f"from {os.path.basename(item['path'])}."
+                )
+            elif intent == "sound":
+                print(
+                    "[MiniMax H3 Ref2VA] Reused sound-effect reference "
+                    f"0.00-{reference.waveform.shape[-1] / audio_sample_rate:.2f}s "
+                    f"for window at {timeline_start_time:.2f}s "
                     f"from {os.path.basename(item['path'])}."
                 )
 

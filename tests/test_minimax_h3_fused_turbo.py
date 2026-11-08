@@ -160,6 +160,13 @@ class TestFusedH3Definitions(unittest.TestCase):
         default_body = {"activated_loras": []}
         normalize_fused_h3_request(default_body)
         self.assertEqual(default_body["num_inference_steps"], 4)
+        self.assertEqual(default_body["override_attention"], "sla")
+
+        for attention in ("veda", "sdpa", "sla"):
+            with self.subTest(attention=attention):
+                body = {"activated_loras": [], "override_attention": attention}
+                normalize_fused_h3_request(body)
+                self.assertEqual(body["override_attention"], attention)
 
     def test_full_step_range_survives_request_and_handler_validation(self):
         from models.minimax_h3.fused_turbo import normalize_fused_h3_request
@@ -504,6 +511,7 @@ class TestFusedH3LoraRuntime(unittest.TestCase):
         pipeline._fused_turbo = True
         pipeline._turbo_lora_active = False
         pipeline._pdd_lora_active = False
+        pipeline.ptd_refasymopd = False
         lora_a = torch.tensor([[1.0, 0.0, -1.0, 0.5]])
         lora_b = torch.tensor([[0.25], [-0.75]])
         inputs = torch.tensor([[1.0, 2.0, 4.0, 8.0]])

@@ -80,7 +80,83 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _duration_recommendations_namespace():
+    app_path = str(_APP)
+    added_app_path = app_path not in sys.path
+    if added_app_path:
+        sys.path.insert(0, app_path)
+    try:
+        from services import h3_duration_recommendations
+        return {
+            name: getattr(h3_duration_recommendations, name)
+            for name in (
+                "attach_h3_duration_recommendations",
+                "h3_duration_recommendations_enabled",
+                "load_h3_duration_recommendations",
+                "match_h3_duration_recommendation",
+            )
+        }
+    finally:
+        if added_app_path:
+            sys.path.remove(app_path)
+
+
+def _video_vae_assets_namespace():
+    app_path = str(_APP)
+    added_app_path = app_path not in sys.path
+    if added_app_path:
+        sys.path.insert(0, app_path)
+    try:
+        from models.minimax_h3.video_vae_assets import (
+            LIGHT_VIDEO_VAE_FILES,
+            VIDEO_VAE_FULL_FILE,
+            VIDEO_VAE_FULL_INT8_FILE,
+            VIDEO_VAE_LIGHT_REVISION,
+            VIDEO_VAE_VARIANT_FILENAMES,
+            get_video_vae_variant_choices,
+        )
+        return {
+            "LIGHT_VIDEO_VAE_FILES": LIGHT_VIDEO_VAE_FILES,
+            "VIDEO_VAE_FULL_FILE": VIDEO_VAE_FULL_FILE,
+            "VIDEO_VAE_FULL_INT8_FILE": VIDEO_VAE_FULL_INT8_FILE,
+            "VIDEO_VAE_LIGHT_REVISION": VIDEO_VAE_LIGHT_REVISION,
+            "VIDEO_VAE_VARIANT_FILENAMES": VIDEO_VAE_VARIANT_FILENAMES,
+            "get_video_vae_variant_choices": get_video_vae_variant_choices,
+        }
+    finally:
+        if added_app_path:
+            sys.path.remove(app_path)
+
+
 def _load_handler_class():
+    app_path = str(_APP)
+    added_app_path = app_path not in sys.path
+    if added_app_path:
+        sys.path.insert(0, app_path)
+    try:
+        from models.minimax_h3.vae_upsampler import (
+            X2_VAE_FILE,
+            X2_VAE_LICENSE_FILE,
+            X2_VAE_NOTICE_FILE,
+            X2_VAE_REPO,
+            X2_VAE_REPO_SUBFOLDER,
+            X2_VAE_REVISION,
+            X2_VAE_VALUE,
+            x2_vae_asset_candidates,
+        )
+        from models.minimax_h3.video_vae_assets import (
+            LIGHT_VIDEO_VAE_FILES,
+            VIDEO_VAE_FULL_FILE,
+            VIDEO_VAE_FULL_INT8_FILE,
+            VIDEO_VAE_LIGHT_REVISION,
+            VIDEO_VAE_VARIANT_FILENAMES,
+            get_video_vae_variant_choices,
+        )
+        from shared.utils import files_locator as fl
+    finally:
+        if added_app_path:
+            sys.path.remove(app_path)
+
     tree = ast.parse(_read(_HANDLER_PATH), filename=str(_HANDLER_PATH))
     selected = []
     for node in tree.body:
@@ -93,6 +169,8 @@ def _load_handler_class():
             "_text_encoder_variants",
             "_recommend_text_encoder",
             "align_h3_num_frames",
+            "normalize_h3_clip_frame_count",
+            "normalize_h3_window_geometry",
             "normalize_h3_overlap_frames",
             "pace_h3_sliding_window_prompt",
             "enforce_h3_source_continuation_prompt",
@@ -105,6 +183,22 @@ def _load_handler_class():
     namespace = {
         "os": os,
         "torch": types.SimpleNamespace(bfloat16="bfloat16"),
+        "X2_VAE_FILE": X2_VAE_FILE,
+        "X2_VAE_LICENSE_FILE": X2_VAE_LICENSE_FILE,
+        "X2_VAE_NOTICE_FILE": X2_VAE_NOTICE_FILE,
+        "X2_VAE_REPO": X2_VAE_REPO,
+        "X2_VAE_REPO_SUBFOLDER": X2_VAE_REPO_SUBFOLDER,
+        "X2_VAE_REVISION": X2_VAE_REVISION,
+        "X2_VAE_VALUE": X2_VAE_VALUE,
+        "x2_vae_asset_candidates": x2_vae_asset_candidates,
+        "LIGHT_VIDEO_VAE_FILES": LIGHT_VIDEO_VAE_FILES,
+        "VIDEO_VAE_FULL_FILE": VIDEO_VAE_FULL_FILE,
+        "VIDEO_VAE_FULL_INT8_FILE": VIDEO_VAE_FULL_INT8_FILE,
+        "VIDEO_VAE_LIGHT_REVISION": VIDEO_VAE_LIGHT_REVISION,
+        "VIDEO_VAE_VARIANT_FILENAMES": VIDEO_VAE_VARIANT_FILENAMES,
+        "get_video_vae_variant_choices": get_video_vae_variant_choices,
+        "fl": fl,
+        **_duration_recommendations_namespace(),
     }
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_HANDLER_PATH), "exec"), namespace)
@@ -121,6 +215,8 @@ def _load_source_function(path: Path, name: str, *, include_private_assignments:
     namespace = {}
     body = []
     if include_private_assignments:
+        if path.resolve() == _HANDLER_PATH.resolve():
+            namespace.update(_video_vae_assets_namespace())
         for node in tree.body:
             if not isinstance(node, ast.Assign):
                 continue
@@ -146,6 +242,7 @@ def _load_h3_memory_helpers():
         "apply_h3_native_omni_memory_policy",
         "normalize_h3_clip_frame_count",
         "normalize_h3_clip_frame_schedule",
+        "normalize_h3_window_geometry",
         "normalize_h3_overlap_frames",
         "pace_h3_sliding_window_prompt",
         "resolve_h3_long_sequence_discard_frames",
@@ -162,7 +259,8 @@ def _load_h3_memory_helpers():
                 selected.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in names:
             selected.append(node)
-    namespace = {}
+    namespace = _duration_recommendations_namespace()
+    namespace.update(_video_vae_assets_namespace())
     module = ast.Module(body=selected, type_ignores=[])
     exec(
         compile(ast.fix_missing_locations(module), str(_HANDLER_PATH), "exec"),
@@ -224,6 +322,7 @@ def _load_turbo_helpers():
 
 def _load_llm_enhance_helpers():
     from services.h3_story_ledger import normalize_h3_dialogue_tags
+    from services.h3_performance_audio import has_h3_performance_audio
 
     tree = ast.parse(_read(_LLM_SERVICE_PATH), filename=str(_LLM_SERVICE_PATH))
     helper_names = {
@@ -231,6 +330,13 @@ def _load_llm_enhance_helpers():
         "_detect_h3_dialogue_language",
         "_h3_quote_is_visible_text",
         "_extract_h3_source_dialogue_entries",
+        "_h3_explicit_cast_speakers",
+        "_h3_explicit_cast_section_spans",
+        "_canonicalize_h3_source_cast_markers",
+        "_h3_source_speaker_marker_match_for_dialogue",
+        "_h3_source_speaker_marker_for_dialogue",
+        "_h3_ref2va_scene_subject_ids",
+        "_extract_h3_ref2va_audio_sections",
         "_h3_ref2va_subject_speaker_map",
         "_extract_h3_quoted_dialogue",
         "_h3_requests_speech",
@@ -239,6 +345,8 @@ def _load_llm_enhance_helpers():
         "_h3_dialogue_schedule",
         "_build_h3_timed_silence_clause",
         "_build_h3_dialogue_requirement",
+        "_h3_dialogue_comparison_text",
+        "_h3_dialogue_words_pattern",
         "_h3_dialogue_contract_satisfied",
         "_h3_timed_silence_contract_satisfied",
         "_h3_ref2va_reference_rows",
@@ -248,6 +356,7 @@ def _load_llm_enhance_helpers():
         "_replace_h3_structured_field",
         "_canonicalize_h3_ref2va_reference_fields",
         "_canonicalize_h3_ref2va_dialogue_speakers",
+        "_h3_ref2va_reference_contract_issues",
         "_h3_ref2va_reference_contract_satisfied",
         "_h3_ref2va_dialogue_binding_contract_satisfied",
         "_h3_voice_binding_contract_satisfied",
@@ -279,6 +388,7 @@ def _load_llm_enhance_helpers():
         "Optional": typing.Optional,
         "repair_text": lambda value: str(value or ""),
         "normalize_h3_dialogue_tags": normalize_h3_dialogue_tags,
+        "has_h3_performance_audio": has_h3_performance_audio,
     }
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_LLM_SERVICE_PATH), "exec"), namespace)
@@ -523,8 +633,36 @@ class TestMiniMaxH3Definition(unittest.TestCase):
     def test_text_encoder_recommendation_is_hardware_aware(self):
         model_def = self.handler.query_model_def("minimax_h3", {})
         recommend = self.handler.recommend_text_encoder
+        # RTX 50 native NVFP4 does not remove the host-RAM pressure of loading
+        # the encoder beside H3's transformer and VAEs.
         self.assertEqual(
-            recommend({"supports_nvfp4": True, "ram_gb": 32}, model_def),
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 31.8, "gpu_vram_gb": 24},
+                model_def,
+            ),
+            "gguf_q2_k",
+        )
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 32, "gpu_vram_gb": 24},
+                model_def,
+            ),
+            "gguf_q2_k",
+        )
+        # Match the detector's half-GiB tolerance around nominal tier edges:
+        # clearly below 48 GiB is low-RAM; the tolerated edge retains NVFP4.
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 47.4, "gpu_vram_gb": 24},
+                model_def,
+            ),
+            "gguf_q2_k",
+        )
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 47.5, "gpu_vram_gb": 24},
+                model_def,
+            ),
             "nvfp4_awq",
         )
         self.assertEqual(
@@ -533,22 +671,71 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         )
         self.assertEqual(
             recommend(
+                {"supports_nvfp4": True, "ram_gb": 64, "gpu_vram_gb": 24},
+                model_def,
+            ),
+            "nvfp4_awq",
+        )
+        self.assertEqual(
+            recommend(
                 {
-                    "supports_nvfp4": False,
+                    "supports_nvfp4": True,
                     "ram_gb": 64,
-                    "gpu_vram_gb": 16,
+                    "gpu_vram_gb": 12,
                 },
                 model_def,
             ),
             "gguf_q2_k",
         )
         self.assertEqual(
-            recommend({"supports_nvfp4": False, "ram_gb": 32}, model_def),
-            "nvfp4_awq",
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 64, "gpu_vram_gb": 16},
+                model_def,
+            ),
+            "gguf_q2_k",
+        )
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": False, "ram_gb": 32, "gpu_vram_gb": 24},
+                model_def,
+            ),
+            "gguf_q2_k",
         )
         self.assertEqual(
             recommend({"supports_nvfp4": False, "ram_gb": 16}, model_def),
             "gguf_q2_k",
+        )
+
+    def test_text_encoder_recommendation_handles_unknown_hardware_and_variants(self):
+        model_def = self.handler.query_model_def("minimax_h3", {})
+        recommend = self.handler.recommend_text_encoder
+
+        # Missing RAM is unknown, not zero: native support plus known 24 GiB
+        # VRAM keeps the native choice instead of triggering low-RAM Q2.
+        self.assertEqual(
+            recommend({"supports_nvfp4": True, "gpu_vram_gb": 24}, model_def),
+            "nvfp4_awq",
+        )
+        # With no probe data, use the smallest generally available fallback
+        # without treating the missing RAM measurement as a low-RAM result.
+        self.assertEqual(recommend(None, model_def), "gguf_q2_k")
+
+        # The recommendation must stay within the model's available variants.
+        reduced = {"minimax_h3_text_encoder_variants": {"gguf_q4_k_m": {}}}
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 32, "gpu_vram_gb": 24},
+                reduced,
+            ),
+            "gguf_q4_k_m",
+        )
+        only_native = {"minimax_h3_text_encoder_variants": {"nvfp4_awq": {}}}
+        self.assertEqual(
+            recommend(
+                {"supports_nvfp4": True, "ram_gb": 32, "gpu_vram_gb": 24},
+                only_native,
+            ),
+            "nvfp4_awq",
         )
 
     def test_all_h3_variants_expose_native_portrait_and_auto_aspect(self):
@@ -920,6 +1107,37 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("VRAM-aware default", duration_slider)
         self.assertIn("manually raise the native pass", duration_slider)
 
+    def test_native_omni_memory_policy_without_gpu_preserves_auto_requests(self):
+        apply_policy = _load_h3_memory_helpers()[
+            "apply_h3_native_omni_memory_policy"
+        ]
+        model_def = {
+            "architecture": "minimax_h3_ref2va",
+            "omni_reference": True,
+        }
+        request = {
+            "resolution": "704x1280",
+            "video_length": 345,
+            "sliding_window_size": 158,
+        }
+        before = dict(request)
+
+        self.assertIsNone(
+            apply_policy(request, model_def, {"gpu_vram_gb": 0})
+        )
+        self.assertEqual(request, before)
+
+        pika_request = {
+            **request,
+            "minimax_h3_reference_sequence": False,
+        }
+        pika_before = dict(pika_request)
+        pika_model_def = {**model_def, "minimax_h3_pika_flex": True}
+        self.assertIsNone(
+            apply_policy(pika_request, pika_model_def, {"gpu_vram_gb": 0})
+        )
+        self.assertEqual(pika_request, pika_before)
+
     def test_full_h3_preflight_recommends_pruned_turbo_without_blocking(self):
         preflight = _load_h3_memory_helpers()["h3_runtime_preflight"]
         full_first_last = {
@@ -1121,6 +1339,93 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "model.lm_head.weight",
         )
 
+    def test_conditioner_namespaces_normalize_wrapped_qwen_aliases_together(self):
+        normalize = _load_source_function(
+            _MAIN_PATH,
+            "_normalize_conditioner_checkpoint_namespaces",
+        )
+        state, quantization, tied = normalize(
+            {
+                "model.language_model.embed_tokens.weight": "same embedding",
+                "model.embed_tokens.weight": "same embedding",
+                "model.visual.patch_embed.proj.weight": "vision",
+                "text_encoder.model.language_model.layers.0.weight": "wrapped",
+                "text_encoder.model.visual.proj.weight": "wrapped vision",
+                "model.layers.1.mlp.up_proj.weight": "canonical",
+            },
+            {
+                "model.language_model.layers.0.self_attn.q_proj": {"weights": "int8", "activations": None},
+                "text_encoder.language_model.layers.0.self_attn.q_proj": {"weights": "int8", "activations": None},
+            },
+            {
+                "model.language_model.embed_tokens.weight": [
+                    "model.language_model.lm_head.weight"
+                ],
+                "text_encoder.language_model.embed_tokens.weight": [
+                    "language_model.lm_head.weight"
+                ],
+            },
+        )
+
+        self.assertEqual(state["model.embed_tokens.weight"], "same embedding")
+        self.assertEqual(state["visual.patch_embed.proj.weight"], "vision")
+        self.assertEqual(
+            state["model.layers.0.weight"],
+            "wrapped",
+        )
+        self.assertEqual(state["visual.proj.weight"], "wrapped vision")
+        self.assertEqual(state["model.layers.1.mlp.up_proj.weight"], "canonical")
+        self.assertEqual(len(state), 5)
+        self.assertEqual(
+            quantization,
+            {"model.layers.0.self_attn.q_proj": {"weights": "int8", "activations": None}},
+        )
+        self.assertEqual(
+            tied,
+            {
+                "model.embed_tokens.weight": ["model.lm_head.weight"],
+            },
+        )
+
+    def test_conditioner_namespace_collisions_raise_without_comparing_tensors(self):
+        normalize = _load_source_function(
+            _MAIN_PATH,
+            "_normalize_conditioner_checkpoint_namespaces",
+        )
+
+        class TensorLike:
+            def __eq__(self, other):
+                raise AssertionError("collision handling compared tensor contents")
+
+        with self.assertRaisesRegex(ValueError, "state_dict.*model.weight"):
+            normalize(
+                {
+                    "model.language_model.weight": TensorLike(),
+                    "model.weight": TensorLike(),
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "quantization_map"):
+            normalize(
+                {},
+                {
+                    "model.language_model.proj": "int8",
+                    "model.proj": "fp8",
+                },
+            )
+
+        with self.assertRaisesRegex(ValueError, "tied_weights_map"):
+            normalize(
+                {},
+                None,
+                {
+                    "model.language_model.embed_tokens.weight": [
+                        "model.language_model.lm_head.weight"
+                    ],
+                    "model.embed_tokens.weight": ["model.output.weight"],
+                },
+            )
+
     def test_h3_resolution_and_encoder_capabilities_reach_the_ui_and_backend(self):
         launch = _read(_LAUNCH_PATH)
         wgp = _read(_WGP_PATH)
@@ -1134,7 +1439,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("elif minimax_h3_references:", wgp)
         self.assertIn("_h3_auto_budgets", wgp)
         self.assertIn("_h3_auto_fallbacks", wgp)
-        self.assertIn("resolveResolution(get().modelOptions, preset, ratio)", store)
+        self.assertIn("resolveResolution(state.modelOptions, preset, ratio)", store)
         self.assertIn("findResolutionSelection(res, get().modelOptions)", store)
         self.assertIn("modelOptions?.resolution_preset_order", presets)
         self.assertNotIn("value !== '768p'", director)
@@ -1472,9 +1777,13 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("const restoredH3SequencePromptMode", store)
         self.assertIn("p.minimax_h3_sequence_prompt_mode === 'creative'", store)
         self.assertIn("p.minimax_h3_window_storyboard === false ? 'manual' : 'auto'", store)
-        self.assertIn(
-            "newParams.minimax_h3_sequence_prompt_mode = restoredH3SequencePromptMode",
-            store,
+        self.assertTrue(
+            re.search(
+                r"newParams\.minimax_h3_sequence_prompt_mode\s*=\s*isDirectorClip"
+                r"\s*\?\s*'manual'\s*:\s*restoredH3SequencePromptMode",
+                store,
+            ),
+            "Director clips retain their exact prompt; ordinary Studio clips restore their saved writer mode",
         )
         non_omni_cleanup = store.split("if (isOmniReference) {", 1)[1].split(
             "if (!isH3Model) {", 1
@@ -1519,7 +1828,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn('<H3MultiWindowControls section="continuity"/>', output_controls)
         self.assertNotIn("Plan Prompt Across Windows", advanced)
         self.assertIn("Window Length", duration)
-        self.assertIn("Recommended", duration)
+        self.assertIn("h3RecommendationLabel(windowRecommendation.basis)", duration)
         self.assertIn("saveH3WindowOverride", duration)
         self.assertIn("h3MaximumFrames(modelOptions, extendedDuration) ?? 345", duration)
         self.assertIn("h3WindowOverrideKey", store)
@@ -1554,7 +1863,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         )
         self.assertLess(
             worker.index("_apply_deferred_prompt_enhancement(job, raw_params)"),
-            worker.index("_apply_per_job_coefficient(job)"),
+            worker.index("_apply_per_job_coefficient(job, defer_h3_residency_reload=True)"),
         )
 
     def test_automatic_multi_window_planners_share_the_generation_lock(self):
@@ -1664,6 +1973,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         updates = []
 
         async def fake_prepare(body, *, prepare_only=False):
+            from services.studio_enhancement import fidelity_retry_limit
+            self.assertEqual(fidelity_retry_limit(), 3)
             captured.update(body)
             captured["prepare_only"] = prepare_only
             return {
@@ -1690,10 +2001,14 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         )
         services_module = types.ModuleType("services")
         services_module.llm_service = fake_llm
+        from services import studio_enhancement
         apply_deferred.__globals__.update({
             "asyncio": asyncio,
             "_prepare_generation_submission": fake_prepare,
             "update_job": fake_update,
+            "enhancement_context": studio_enhancement.enhancement_context,
+            "_enhancement_settings_snapshot": lambda: {"enhance_fidelity_retries": 3},
+            "is_cancel_requested": lambda job: False,
         })
         job = {
             "id": "planned-1",
@@ -1708,7 +2023,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             },
         }
 
-        with mock.patch.dict(sys.modules, {"services": services_module}):
+        with mock.patch.dict(sys.modules, {"services": services_module,
+                                          "services.studio_enhancement": studio_enhancement}):
             apply_deferred(job)
 
         self.assertTrue(captured["prepare_only"])
@@ -1853,7 +2169,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("h3_reference_activation_gb", launch)
         self.assertIn("compute_h3_weight_budget", launch)
         self.assertIn("h3_weight_budget_gb", launch)
-        self.assertIn("resident H3 profile will reload with packed-sequence headroom", launch)
+        self.assertIn("resident H3 profile will reload with packed-sequence ", launch)
+        self.assertIn("activation headroom", launch)
         self.assertIn("_maestro_profile_vram_coefficient", wgp)
         self.assertIn("get_linear_split_map", transformer)
         self.assertIn("MINIMAX_H3_ACTIVATION_CHUNK_TOKENS", transformer)
@@ -1929,13 +2246,14 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             launch,
         )
 
-    def test_h3_is_enabled_for_existing_and_fresh_installs(self):
+    def test_h3_defaults_and_existing_install_migrations(self):
         store = _read(_STORE_PATH)
         default_block = store.split("const DEFAULT_ENABLED_MODELS = new Set([", 1)[1].split("])\n", 1)[0]
         self.assertIn("'minimax_h3'", default_block)
         self.assertIn("'minimax_h3_full'", default_block)
         self.assertIn("'minimax_h3_ref2va'", default_block)
-        self.assertIn("'minimax_h3_ref2va_full'", default_block)
+        self.assertIn("'minimax_h3_ref2va_fused_turbo'", default_block)
+        self.assertNotIn("'minimax_h3_ref2va_full'", default_block)
         defaults_version = int(
             store.split("const DEFAULTS_VERSION = ", 1)[1].splitlines()[0]
         )
@@ -2056,7 +2374,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("intent=AUDIO REUSE / PERFORMANCE DRIVER", store)
         self.assertIn("intent=VOICE REFERENCE", store)
         self.assertIn('draggable', section)
-        self.assertIn("Include soundtrack", section)
+        self.assertIn("soundtrack role", section)
+        self.assertIn("Preserve soundtrack / performance timeline", section)
         self.assertIn("Attach audio", section)
         self.assertIn("audio_path", section)
         self.assertIn("High detail (official PDD recipe)", section)
@@ -2131,11 +2450,11 @@ class TestMiniMaxH3Definition(unittest.TestCase):
     def test_omni_drive_audio_adopts_timeline_without_mutating_voice_or_style(self):
         section = _read(_OMNI_REFERENCE_SECTION_PATH)
         duration_slider = _read(_DURATION_SLIDER_PATH)
-        handler_start = section.index("const setAudioIntent =")
+        handler_start = section.index("const applyDriveDuration =")
         handler_end = section.index("const attachAudio =", handler_start)
         handler = section[handler_start:handler_end]
 
-        self.assertIn("if (intent !== 'drive') return", handler)
+        self.assertIn("if (intent === 'drive') applyDriveDuration", handler)
         self.assertIn("Number(reference?.duration_seconds)", handler)
         self.assertIn("audioDuration > slidingWindowSeconds + (1 / fps)", handler)
         self.assertIn("setParam('minimax_h3_reference_sequence', true)", handler)
@@ -2199,7 +2518,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             helpers["_h3_dialogue_contract_satisfied"]('A man says, "Hello."', fallback)
         )
         self.assertIn("<d>[English] Hello.</d>", fallback)
-        self.assertIn("begin at the first frame", fallback)
+        self.assertIn("Render the requested dialogue clearly", fallback)
+        self.assertNotIn("Continuous scene-appropriate stereo ambience", fallback)
         self.assertTrue(
             helpers["_h3_voice_binding_contract_satisfied"](
                 fallback,
@@ -2268,7 +2588,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             )
         )
         duplicated = timed.replace(
-            "summary: [reference generation + audio reference] A finished video matching the requested action, identity, setting, and explicitly tagged dialogue.",
+            "summary: [reference generation + audio reference] A finished video matching the requested action, identity, setting and explicitly tagged dialogue.",
             'summary: Blaine declares, "Snap this, bitch."',
         )
         deduplicated = helpers["_strip_h3_untagged_dialogue_duplicates"](
@@ -2429,9 +2749,9 @@ class TestMiniMaxH3Definition(unittest.TestCase):
 class TestMiniMaxH3RuntimeSource(unittest.TestCase):
     def test_runtime_uses_the_official_dual_scheduler_and_audio_output(self):
         main = _read(_MAIN_PATH)
-        self.assertIn("shift=3.0 if self.viggle else 12.0", main)
+        self.assertIn('shift=3.0 if self.viggle else float(model_def.get("minimax_h3_video_shift", 12.0))', main)
         self.assertIn("solver=self.sample_solver", main)
-        self.assertIn("MiniMaxH3Scheduler(shift=3.0)", main)
+        self.assertIn('MiniMaxH3Scheduler(shift=float(model_def.get("minimax_h3_audio_shift", 3.0)))', main)
         self.assertIn('"audio_sampling_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE', main)
         self.assertIn("MINIMAX_H3_KEYFRAME_ENCODE_SEED", main)
         self.assertIn("prepare_keyframe_image", main)
@@ -2595,7 +2915,7 @@ class TestMiniMaxH3RuntimeSource(unittest.TestCase):
         video_vae = _read(_VIDEO_VAE_PATH)
         self.assertIn("settings_version < 2.58", handler)
         self.assertIn("normalize_h3_overlap_frames", handler)
-        self.assertIn("Decode one tile at a time", video_vae)
+        self.assertIn("_h3_vae_decode_tile_batch_size", video_vae)
         self.assertIn("new_tails.append", video_vae)
         self.assertIn("keep_all_latents", video_vae)
 
@@ -2770,7 +3090,7 @@ class TestMiniMaxH3RuntimeSource(unittest.TestCase):
         self.assertIn("First Block Cache", optimizations)
         self.assertIn("'skip_steps_cache_type', checked ? 'first_block' : ''", optimizations)
         self.assertIn("First Block Cache Tuning", advanced)
-        self.assertIn("disabled={h3TurboMode}", advanced)
+        self.assertIn("disabled={h3TurboMode || !!qwenTurboProfile}", advanced)
         self.assertIn("minimax_h3_turbo_mode?: boolean", types_source)
         self.assertIn("minimax_h3_turbo_preset?: string", types_source)
         self.assertIn("minimax_h3_runtime_advisory?:", types_source)
@@ -3682,6 +4002,14 @@ class TestMiniMaxH3RuntimeMath(unittest.TestCase):
             with mock.patch(
                 "models.minimax_h3.ref2va.decode_reference_audio",
                 return_value=(waveform, 10),
+            ), mock.patch(
+                "models.minimax_h3.ref2va._decode_timeline_audio_window",
+                side_effect=lambda _path, start, duration: (
+                    waveform[:, round(start * 10):round((start + duration) * 10)], 10,
+                ),
+            ), mock.patch(
+                "models.minimax_h3.ref2va.extract_reference_audio_window",
+                side_effect=lambda path, *_args, **_kwargs: path,
             ):
                 references = prepare_references(
                     [
@@ -3690,16 +4018,19 @@ class TestMiniMaxH3RuntimeMath(unittest.TestCase):
                             "type": "audio",
                             "path": str(audio_paths[0]),
                             "audio_intent": "drive",
+                            "effective_duration_seconds": 5.0,
                         },
                         {
                             "type": "audio",
                             "path": str(audio_paths[1]),
                             "audio_intent": "style",
+                            "effective_duration_seconds": 5.0,
                         },
                         {
                             "type": "audio",
                             "path": str(audio_paths[2]),
                             "audio_intent": "voice",
+                            "effective_duration_seconds": 5.0,
                         },
                     ],
                     num_frames=24,

@@ -17,9 +17,16 @@ non_diegetic_music: ...
 REFERENCE BINDINGS
 - The ordered reference inventory is authoritative. Use only its existing <Subject N>,
   <Picture N>, <Video N>, and <Audio N> labels. Never invent, renumber, or emit a placeholder.
-- <Subject N> is a stable visible identity. Define each subject once using its supplied visual
+- Subject and media indices are independent: copy each relationship from the inventory.
+  An environment's Subject number never determines its Picture number. Keep the correct
+  image binding when referring to that location, identity, object, or object view.
+- A character <Subject N> is a stable visible identity. Define it once using its supplied visual
   reference. An identity picture or video supplies appearance, not its source pose, framing,
-  background, dialogue, or opening frame.
+  background, dialogue, or opening frame. Other Subjects may represent a scene or visual style:
+  keep those roles unchanged and never make an environment Subject stand, speak, or become a person.
+- A video marked as motion/camera guidance does not allocate a character Subject. Use the
+  character's plain name with that existing Video label when describing the requested guidance;
+  do not invent a Subject number. An environment picture never supplies a character's appearance.
 - Named characters with no supplied visual reference remain prompt-native named characters.
   Keep them stable, but never invent a Subject/Picture/Video/Audio binding for them.
 - Unless the request explicitly asks for twins, clones, copies, or multiple versions, keep one
@@ -49,15 +56,48 @@ FIELD CONTENT
   Establish location, composition, subjects, lighting, action, motivated camera coverage, cuts,
   dialogue, reactions, and a concrete final state. Put `[Shot 1]` before the opening shot, with
   no timestamp. Later shots use `[Shot N] At MM:SS.mmm, ...`. Keep every event inside Duration.
+- Give each requested camera cut or switch its own shot marker; do not bury a separate view
+  inside the preceding shot. Continuous camera movement stays in one shot when requested.
+  Spread the requested action chain through Duration, with time for transitions and a clear
+  ending. Preserve authored timings and deliberate holds; otherwise avoid completing the
+  entire chain early and leaving a long interval that could restart its final action.
 - Preserve blocking through every cut. A later angle starts from the physical result of the
   preceding shot; it cannot make a character re-enter, re-approach, or re-sit after that action
   has already completed.
+- Carry the achieved state of characters, creatures, objects, and environments through every
+  angle: location, motion, surface contact, occupants, attachments, possession, and open/closed
+  states persist until an action visibly changes them. A camera cut changes the view, not the
+  physical result. Keep source-required intermediate states before the departure or transition
+  that ends them. Complete one-time actions once; later coverage shows their continuing result.
+  Preserve intentional flashbacks, independent cuts, transformations, and repetitions requested
+  by the user rather than forcing them into continuous action.
+- Make carried state visible in the new framing. Merely naming an established state is not
+  enough: describe the observable contact, separation, relative surroundings, or motion cues
+  that support it. A tighter view must show the same world state through its available visual
+  evidence. Rebuild reference backgrounds and views for the current action rather than letting
+  their familiar composition silently return an object or character to an earlier state.
+  For lost surface contact, show separation or the supporting surface beneath the object.
+  In an attached, tight, or interior view, use relative surroundings seen through openings
+  to convey the established height or movement. After a room transition, show destination
+  features; for possession, show the appropriate hand or attachment contact. Use qualitative
+  evidence supported by the source without inventing numerical positions or new destinations.
+- When the source establishes that several object references show complementary views or
+  features of one object, say so in the opening shot and carry that same object through later
+  views. Keep its surroundings appropriate to its current story state. Similar-looking
+  references alone do not establish a shared object; preserve distinct objects and counts.
 - overall_soundscape: concise target-scene ambience and synchronized physical effects.
 - non_diegetic_music: audience-only music when requested; otherwise N/A.
 
 DIALOGUE
+- Preserve explicit speaker-to-Subject declarations from older structured prompts and reuse
+  already established speakers within the current clip. Write the mapped <Subject N> beside
+  every referenced character's dialogue; do not equate Subject, speaker, and Audio numbers.
+  Shot/scene headings, timestamps, and production directions never identify a speaking character.
 - Copy every supplied quoted line verbatim before planning the visuals. Every copied line must
   appear exactly once inside a <d> block, in source order, adjacent to its true speaker.
+- In a source sentence such as `(S1) asks (S2) ... <d>Words</d>`, S1 is the speaker and S2
+  is the listener. Likewise, `S1 says to S3` belongs to S1. Do not assign dialogue to the nearest
+  mentioned listener or confuse user cast aliases with the inventory's Subject numbers.
 - Use this direct form for a referenced on-screen speaker:
   `<Subject 2> (S1) says in the voice referenced from <Audio 1>, <d>[English] Exact words.</d>`
 - Put only the language and literal words inside <d>. Scene setup, camera direction, action,
